@@ -27,7 +27,10 @@
         MODEL_HEADING_OFFSET: -90,    // Cesium ENU East-to-North alignment
         GEOFS_MAP_SYNC: true,         // Synchronize with GeoFS NAV map
         DYNAMIC_SPAWN_ON_MOVE: true,  // Continuously spawn new planes as player moves
-        DESPAWN_BUFFER_KM: 2600       // Despawn planes that fly beyond 1,500 miles + buffer
+        DESPAWN_BUFFER_KM: 2414.02,   // Exactly 1,500 statute miles (planes disappear as you fly away)
+        DANGER_ZONE_MILES: 5.0,       // Configurable proximity alert danger zone (default 5 miles)
+        DANGER_ZONE_ALT_FT: 1000,     // Configurable altitude separation threshold (default 1,000 ft)
+        PROXIMITY_AUDIO_ALERT: true   // Visual & audio notifications for collision hazard
     };
 
     const PANEL_ID = 'geofs-baked-traffic-panel';
@@ -778,6 +781,7 @@
     let viewer = null;
     let started = false;
     let panelVisible = true;
+    let panelCallsignSearch = '';
 
     // ============================================================
     // GEODESIC & NAVIGATION MATH
@@ -925,11 +929,67 @@
             }
         }
         const bestProgress = (low + high) / 2;
-        return intermediateGreatCirclePoint(oLat, oLon, dLat, dLon, bestProgress);
+        const pt = intermediateGreatCirclePoint(oLat, oLon, dLat, dLon, bestProgress);
+        pt.progress = bestProgress;
+        return pt;
+    }
+
+    function getPlaneRouteNodes(planeOrFlight, origHub, destHub) {
+        const nodes = [];
+        if (origHub) nodes.push({ lat: origHub.lat, lon: origHub.lon, name: origHub.code || 'ORIG' });
+        const wps = (planeOrFlight && planeOrFlight.waypoints) || [];
+        for (let i = 0; i < wps.length; i++) {
+            const w = wps[i];
+            if (w && Number.isFinite(w.lat) && Number.isFinite(w.lon)) {
+                const prev = nodes[nodes.length - 1];
+                if (!prev || distanceKm(prev, w) > 0.5) {
+                    nodes.push({ lat: w.lat, lon: w.lon, name: w.name || ('WP' + (i + 1)) });
+                }
+            }
+        }
+        if (destHub) {
+            const prev = nodes[nodes.length - 1];
+            if (!prev || distanceKm(prev, destHub) > 0.5) {
+                nodes.push({ lat: destHub.lat, lon: destHub.lon, name: destHub.code || 'DEST' });
+            }
+        }
+        return nodes;
+    }
+
+    function snapPlaneToRoutePolyline(pLat, pLon, waypoints, origHub, destHub) {
+        const nodes = getPlaneRouteNodes({ waypoints: waypoints }, origHub, destHub);
+        if (nodes.length < 2) {
+            return { lat: pLat, lon: pLon, progress: 0, legIndex: 0, distanceKm: 0 };
+        }
+
+        let bestPt = null;
+        let bestDistKm = Infinity;
+        let bestLeg = 0;
+
+        for (let i = 0; i < nodes.length - 1; i++) {
+            const a = nodes[i];
+            const b = nodes[i + 1];
+            const snapped = snapPlaneToRouteCorridor(pLat, pLon, a.lat, a.lon, b.lat, b.lon);
+            const d = distanceKm({ lat: pLat, lon: pLon }, snapped);
+            if (d < bestDistKm) {
+                bestDistKm = d;
+                bestPt = snapped;
+                bestLeg = i;
+            }
+        }
+
+        return {
+            lat: bestPt ? bestPt.lat : pLat,
+            lon: bestPt ? bestPt.lon : pLon,
+            progress: bestPt ? bestPt.progress : 0,
+            legIndex: bestLeg,
+            distanceKm: bestDistKm
+        };
     }
 
     // STRICT ROUTE PLACEMENT EVALUATION:
-    // "Make it so that if a plane is off route it gets deleted."
+    // Validate a plane against its actual waypoint legs (including curved routes),
+    // not only the great-circle line between origin and destination.
     function isPlaneOffRoute(plane) {
         if (!plane || !Number.isFinite(plane.lat) || !Number.isFinite(plane.lon)) return true;
         if (Math.abs(plane.lat) < 0.001 && Math.abs(plane.lon) < 0.001) return true;
@@ -957,6 +1017,36 @@
             return true;
         }
 
+        // Terminal protection: within 25 miles of dest or 35 miles of orig, maneuvering is authorized
+        if (dDestMi <= 25.0 || dOrigMi <= 35.0) {
+            return false;
+        }
+
+        const maxTol = totalDistMi > 3500 ? 190.0 : 75.0;
+        const nodes = getPlaneRouteNodes(plane, origHub, destHub);
+
+        // Check against actual waypoint legs (including curved routes)
+        if (nodes.length > 2) {
+            const polySnapped = snapPlaneToRoutePolyline(plane.lat, plane.lon, plane.waypoints, origHub, destHub);
+            const xtMi = polySnapped.distanceKm * 0.621371;
+            if (xtMi > maxTol) {
+                return true;
+            }
+
+            // Progression check along the route:
+            // Check if aircraft has overshot past the destination leg into open space
+            if (polySnapped.legIndex === nodes.length - 2 && polySnapped.progress >= 0.999 && dDestMi > 25.0) {
+                return true;
+            }
+            // Check if aircraft is behind the origin leg
+            if (polySnapped.legIndex === 0 && polySnapped.progress <= 0.001 && dOrigMi > 35.0) {
+                return true;
+            }
+
+            return false;
+        }
+
+        // Great-circle direct corridor checks when no intermediate waypoints exist:
         // 3. Along-Track Progression Envelope (> 1.25)
         const progressionRatio = (dOrigKm + dDestKm) / Math.max(1, totalDistKm);
         if (progressionRatio > 1.25 && dDestMi > 25.0 && dOrigMi > 35.0) {
@@ -966,7 +1056,6 @@
         // 4. Lateral Airway Corridor Tolerance
         const xtKm = calculateCrossTrackDistanceKm(plane.lat, plane.lon, origHub.lat, origHub.lon, destHub.lat, destHub.lon);
         const xtMi = xtKm * 0.621371;
-        const maxTol = totalDistMi > 3500 ? 190.0 : 75.0;
         if (xtMi > maxTol && dDestMi > 25.0 && dOrigMi > 35.0) {
             return true;
         }
@@ -1618,7 +1707,7 @@
             this.id = id;
             this.fleet = fleetItem;
             this.callsign = createCallsign(fleetItem.code);
-            // Flightradar24 Transponder Tracking Telemetry (100% correct on plane routes)
+            // Embedded airline flight database transponder telemetry
             this.squawk = generateSquawkCode(this.id, fleetItem.code);
             this.hex = generateModeSHex(this.callsign, this.id);
             this.transponderCode = this.squawk;
@@ -1913,6 +2002,24 @@
             this.alt += altDelta;
             this.pitch = clamp(altDelta * 1.5, -4, 8);
 
+            // Dynamic Flight Phase Transition: Flights naturally progress through departure, cruise, and approach
+            const origAirportHub = resolveHub(this.origin);
+            const destAirportHub = resolveHub(this.destination);
+            if (origAirportHub && destAirportHub) {
+                const distToDestMi = distanceKm({ lat: this.lat, lon: this.lon }, destAirportHub) * 0.621371;
+                const distToOrigMi = distanceKm({ lat: this.lat, lon: this.lon }, origAirportHub) * 0.621371;
+                if (distToDestMi <= 25.0) {
+                    this.flightPhase = 'APPROACH';
+                    this.isOverflight = false;
+                } else if (distToOrigMi <= 50.0 && this.alt < (this.targetAlt * 0.85)) {
+                    this.flightPhase = 'CLIMB';
+                    this.isOverflight = false;
+                } else {
+                    this.flightPhase = 'CRUISE';
+                    this.isOverflight = true;
+                }
+            }
+
             // ============================================================
             // WAYPOINT CAPTURE & CONTINUOUS ROUTE ADVANCE
             // ============================================================
@@ -1968,7 +2075,7 @@
         }
 
         getFR24Packet() {
-            // Authentic Flightradar24 live feed packet format:
+            // Embedded flight database telemetry packet format:
             // [hex, lat, lon, track, alt_ft, speed_kts, squawk, radar, type, reg, timestamp, origin, dest, flightNumber, onGround, vSpeed, callsign]
             return [
                 this.hex,
@@ -2010,20 +2117,20 @@
                 speedKts: Math.round(this.speed),
                 heading: Math.round(this.heading),
                 radarReceiver: this.fr24Radar,
-                transponderStatus: '100% CORRECT (TRANSPONDER VERIFIED)',
+                transponderStatus: 'TRANSPONDER ACTIVE (ROUTE VERIFIED)',
                 fr24DataUrl: this.fr24DataUrl,
             };
         }
     }
 
-    // Global Flightradar24 Live Feed API for GeoFS
+    // Flight Telemetry Feed API for GeoFS (Embedded Airline Flight Database)
     if (typeof window !== 'undefined') {
         window.getFR24LiveFeed = function() {
             const feed = {
                 full_count: traffic.length,
                 version: 1.5,
-                source: 'Flightradar24 ADS-B Transponder Network',
-                transponderStatus: '100% ROUTE VERIFIED',
+                source: 'Embedded Airline Flight Database',
+                transponderStatus: 'ROUTE VERIFIED',
                 aircraft: {}
             };
             traffic.forEach(p => {
@@ -2098,14 +2205,17 @@
                         verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
                         pixelOffset: new Cesium.Cartesian2(0, isClose ? -45 : -16),
                         disableDepthTestDistance: Number.POSITIVE_INFINITY,
-                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 300000) : undefined
+                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 300000) : undefined,
+                        translucencyByDistance: (window.Cesium && Cesium.NearFarScalar) ? new Cesium.NearFarScalar(40000, 1.0, 240000, 0.0) : undefined,
+                        scaleByDistance: (window.Cesium && Cesium.NearFarScalar) ? new Cesium.NearFarScalar(10000, 1.0, 240000, 0.45) : undefined
                     },
                     model: {
                         uri: plane.fleet.uri,
-                        minimumPixelSize: 42,
+                        minimumPixelSize: isClose ? Math.max(1, Math.round(36 * Math.max(0, 1 - (distKm - 30) / 120))) : 0,
                         maximumScale: 30000,
                         scale: 1,
-                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 100000) : undefined
+                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 180000) : undefined,
+                        scaleByDistance: (window.Cesium && Cesium.NearFarScalar) ? new Cesium.NearFarScalar(2000, 1.0, 140000, 0.15) : undefined
                     }
                 };
 
@@ -2132,15 +2242,25 @@
                 if (plane.entity.label) {
                     plane.entity.label.text = labelText;
                     plane.entity.label.pixelOffset = new Cesium.Cartesian2(0, isClose ? -45 : -16);
+                    if (window.Cesium && Cesium.NearFarScalar && !plane.entity.label.translucencyByDistance) {
+                        plane.entity.label.translucencyByDistance = new Cesium.NearFarScalar(40000, 1.0, 240000, 0.0);
+                        plane.entity.label.scaleByDistance = new Cesium.NearFarScalar(10000, 1.0, 240000, 0.45);
+                    }
                 }
 
-                if (!plane.entity.model && Cesium.ModelGraphics) {
+                if (plane.entity.model) {
+                    plane.entity.model.minimumPixelSize = isClose ? Math.max(1, Math.round(36 * Math.max(0, 1 - (distKm - 30) / 120))) : 0;
+                    if (window.Cesium && Cesium.NearFarScalar && !plane.entity.model.scaleByDistance) {
+                        plane.entity.model.scaleByDistance = new Cesium.NearFarScalar(2000, 1.0, 140000, 0.15);
+                    }
+                } else if (!plane.entity.model && Cesium.ModelGraphics) {
                     plane.entity.model = new Cesium.ModelGraphics({
                         uri: plane.fleet.uri,
-                        minimumPixelSize: 42,
+                        minimumPixelSize: isClose ? Math.max(1, Math.round(36 * Math.max(0, 1 - (distKm - 30) / 120))) : 0,
                         maximumScale: 30000,
                         scale: 1,
-                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 100000) : undefined
+                        distanceDisplayCondition: (window.Cesium && Cesium.DistanceDisplayCondition) ? new Cesium.DistanceDisplayCondition(0, 180000) : undefined,
+                        scaleByDistance: (window.Cesium && Cesium.NearFarScalar) ? new Cesium.NearFarScalar(2000, 1.0, 140000, 0.15) : undefined
                     });
                 }
             }
@@ -2621,8 +2741,21 @@
                         '</button>' +
                     '</div>';
 
+                const distMi = plane.distanceMiles || (plane.distanceKm * 0.621371);
+                if (distMi >= 1500) {
+                    if (marker) {
+                        try { leafletMap.removeLayer(marker); } catch (e) {}
+                        mapMarkers.delete(markerKey);
+                    }
+                    return;
+                }
+                let markerOpacity = 1.0;
+                if (distMi > 100) {
+                    markerOpacity = Math.max(0.0, 1.0 - (distMi - 100) / (1500 - 100));
+                }
+
                 if (!marker) {
-                    marker = L.marker([plane.lat, plane.lon], { icon: icon, interactive: true, zIndexOffset: 2500 });
+                    marker = L.marker([plane.lat, plane.lon], { icon: icon, interactive: true, zIndexOffset: 2500, opacity: markerOpacity });
                     marker.addTo(leafletMap);
                     marker.bindPopup(popupHtml);
                     mapMarkers.set(markerKey, marker);
@@ -2632,6 +2765,9 @@
                     }
                     marker.setLatLng([plane.lat, plane.lon]);
                     marker.setIcon(icon);
+                    if (typeof marker.setOpacity === 'function') {
+                        marker.setOpacity(markerOpacity);
+                    }
                     if (marker.getPopup && marker.getPopup()) {
                         marker.setPopupContent(popupHtml);
                     }
@@ -2807,7 +2943,7 @@
         const lon = Number(targetLon);
         const alt = Number.isFinite(targetAlt) ? Math.max(10, Number(targetAlt)) : 1000;
         const hdg = Number.isFinite(targetHeading) ? ((Number(targetHeading) % 360 + 360) % 360) : 0;
-        const kias = Number.isFinite(targetKias) ? Number(targetKias) : 220;
+        const kias = Number.isFinite(targetKias) ? Math.max(220, Number(targetKias)) : 280;
 
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
         if (Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001) return false; // avoid Null Island
@@ -2817,7 +2953,24 @@
 
         let success = false;
 
-        // 1. Primary GeoFS API flyTo call (using single 5-element array [lat, lon, alt, heading, true])
+        // 1. Unpause simulator if paused so aircraft does not spawn frozen
+        try {
+            if (typeof geofsObj.pause === 'function') {
+                if (typeof geofsObj.isPaused === 'function') {
+                    if (geofsObj.isPaused()) geofsObj.pause(false);
+                } else if (geofsObj.paused) {
+                    geofsObj.pause(false);
+                }
+            }
+            if (geofsObj.isPaused === true) {
+                geofsObj.isPaused = false;
+            }
+        } catch (e) {}
+
+        // 2. Clear any formation clamp that would freeze position
+        geofsObj._formationTargetPlane = null;
+
+        // 3. Primary GeoFS API flyTo call (using single 5-element array [lat, lon, alt, heading, true])
         try {
             if (typeof geofsObj.flyTo === 'function') {
                 geofsObj.flyTo([lat, lon, alt, hdg, true]);
@@ -2827,7 +2980,7 @@
             try { geofsObj.flyTo([lat, lon, alt, hdg]); success = true; } catch (e2) {}
         }
 
-        // 2. Direct Aircraft Instance Placement (Rule 3: llaLocation & animationValues)
+        // 4. Direct Aircraft Instance Placement & Physics Unfreeze
         try {
             const inst = geofsObj.aircraft?.instance;
             if (inst) {
@@ -2847,29 +3000,64 @@
                     inst.llaLocation = [lat, lon, alt];
                 }
 
-                // Rule 3: Synchronize animationValues and animationValue
+                // Rule 3: Synchronize animationValues and animationValue for active forward flight
+                const altFt = alt * 3.28084;
                 if (inst.animationValues) {
                     inst.animationValues.kias = kias;
-                    inst.animationValues.altitude = alt * 3.28084;
+                    inst.animationValues.altitude = altFt;
                     inst.animationValues.heading = hdg;
                     inst.animationValues.pitch = 0;
                     inst.animationValues.roll = 0;
+                    inst.animationValues.climbrate = 0;
+                    inst.animationValues.rpm = 2500;
+                    inst.animationValues.throttle = 0.85;
                 }
                 if (inst.animationValue) {
                     inst.animationValue.kias = kias;
-                    inst.animationValue.altitude = alt * 3.28084;
+                    inst.animationValue.altitude = altFt;
                     inst.animationValue.heading = hdg;
                     inst.animationValue.pitch = 0;
                     inst.animationValue.roll = 0;
                 }
                 if (geofsObj.animation?.values) {
                     geofsObj.animation.values.kias = kias;
-                    geofsObj.animation.values.altitude = alt * 3.28084;
+                    geofsObj.animation.values.altitude = altFt;
                     geofsObj.animation.values.heading = hdg;
+                    geofsObj.animation.values.pitch = 0;
+                    geofsObj.animation.values.roll = 0;
+                    geofsObj.animation.values.throttle = 0.85;
                 }
 
-                // Physics rigid body velocity synchronization
+                // Release brakes, parking brake, and set forward cruise throttle
+                if (inst.controls) {
+                    inst.controls.throttle = Math.max(0.75, Math.min(1.0, kias / 450));
+                    inst.controls.parkingBrake = false;
+                    inst.controls.brakes = 0;
+                    inst.controls.airbrakes = 0;
+                    if (alt > 300) {
+                        inst.controls.gear = 0;
+                    }
+                }
+
+                // Start engines so plane has active thrust
+                if (typeof inst.startEngine === 'function') {
+                    try { inst.startEngine(); } catch (e) {}
+                }
+                if (inst.engine && typeof inst.engine === 'object') {
+                    inst.engine.on = true;
+                }
+                if (Array.isArray(inst.engines)) {
+                    inst.engines.forEach(eng => { if (eng) eng.on = true; });
+                }
+
+                // Physics rigid body velocity synchronization & Bullet/Ammo unfreeze
                 if (inst.rigidBody) {
+                    if (typeof inst.rigidBody.activate === 'function') {
+                        inst.rigidBody.activate(true);
+                    }
+                    if (typeof inst.rigidBody.setActivationState === 'function') {
+                        inst.rigidBody.setActivationState(1); // ACTIVE_TAG (awake)
+                    }
                     if (typeof inst.rigidBody.setAngularVelocity === 'function') {
                         inst.rigidBody.setAngularVelocity([0, 0, 0]);
                     }
@@ -2883,25 +3071,72 @@
                         ]);
                     }
                 }
+
+                // Reset crash state and dismiss overlay
+                inst.crashed = false;
+                dismissCrashOverlay();
                 success = true;
             }
         } catch (instErr) {
             console.warn('[Traffic] Direct aircraft instance place warning:', instErr);
         }
 
-        // 3. Camera synchronization
+        // 5. Camera synchronization
         try {
             if (geofsObj.camera && typeof geofsObj.camera.set === 'function') {
                 geofsObj.camera.set([lat, lon, alt]);
             }
         } catch (camErr) {}
 
-        // 4. Update tracking state and immediately populate traffic for the new sector
+        // Multi-frame unfreeze watchdog: keep physics and controls active over initial frames
+        let unfreezeFrames = 0;
+        function unfreezeTick() {
+            try {
+                const a = geofsObj.aircraft?.instance;
+                if (a) {
+                    if (a.controls) {
+                        a.controls.parkingBrake = false;
+                        a.controls.brakes = 0;
+                        if (!a.controls.throttle || a.controls.throttle < 0.5) {
+                            a.controls.throttle = 0.85;
+                        }
+                    }
+                    if (a.rigidBody) {
+                        if (typeof a.rigidBody.activate === 'function') a.rigidBody.activate(true);
+                        if (typeof a.rigidBody.setActivationState === 'function') a.rigidBody.setActivationState(1);
+                        if (typeof a.rigidBody.setLinearVelocity === 'function') {
+                            const speedMs = kias * 0.514444;
+                            const rad = hdg * Math.PI / 180;
+                            a.rigidBody.setLinearVelocity([
+                                Math.sin(rad) * speedMs,
+                                Math.cos(rad) * speedMs,
+                                0
+                            ]);
+                        }
+                    }
+                    if (a.animationValues) {
+                        a.animationValues.kias = kias;
+                    }
+                }
+                if (typeof geofsObj.pause === 'function' && typeof geofsObj.isPaused === 'function' && geofsObj.isPaused()) {
+                    geofsObj.pause(false);
+                }
+            } catch (e) {}
+            unfreezeFrames++;
+            if (unfreezeFrames < 3 && typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(unfreezeTick);
+            }
+        }
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(unfreezeTick);
+        }
+
+        // 6. Update tracking state and immediately populate traffic for the new sector
         lastPlayerLoc = [lat, lon];
         lastPopulateTime = Date.now();
         populateTrafficAround([lat, lon], preservePlane);
 
-        console.log('[Traffic] Repositioned to ' + (label || (lat.toFixed(4) + ', ' + lon.toFixed(4))) + ' at ' + Math.round(alt) + 'm HDG ' + Math.round(hdg) + '°');
+        console.log('[Traffic] Repositioned to ' + (label || (lat.toFixed(4) + ', ' + lon.toFixed(4))) + ' at ' + Math.round(alt) + 'm HDG ' + Math.round(hdg) + '° at ' + Math.round(kias) + ' kts (UNFROZEN)');
         return success;
     }
 function dismissCrashOverlay() {
@@ -3024,6 +3259,128 @@ function dismissCrashOverlay() {
         } catch(e) {}
     }
 
+    let lastProximityAudioTime = 0;
+    function playGeofsTcasSound(distMiles) {
+        if (!CONFIG.PROXIMITY_AUDIO_ALERT) return;
+        const now = Date.now();
+        if (now - lastProximityAudioTime < 4500) return;
+        lastProximityAudioTime = now;
+
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (AudioCtx) {
+                const ctx = new AudioCtx();
+                const t0 = ctx.currentTime;
+                // Dual-tone TCAS Cockpit Alert: 880Hz then 659Hz
+                const osc1 = ctx.createOscillator();
+                const gain1 = ctx.createGain();
+                osc1.type = 'sawtooth';
+                osc1.frequency.setValueAtTime(880, t0);
+                gain1.gain.setValueAtTime(0.25, t0);
+                gain1.gain.exponentialRampToValueAtTime(0.001, t0 + 0.16);
+                osc1.connect(gain1);
+                gain1.connect(ctx.destination);
+                osc1.start(t0);
+                osc1.stop(t0 + 0.18);
+
+                const osc2 = ctx.createOscillator();
+                const gain2 = ctx.createGain();
+                osc2.type = 'sawtooth';
+                osc2.frequency.setValueAtTime(659, t0 + 0.18);
+                gain2.gain.setValueAtTime(0.28, t0 + 0.18);
+                gain2.gain.exponentialRampToValueAtTime(0.001, t0 + 0.38);
+                osc2.connect(gain2);
+                gain2.connect(ctx.destination);
+                osc2.start(t0 + 0.18);
+                osc2.stop(t0 + 0.42);
+            }
+        } catch(e) {}
+
+        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            try {
+                window.speechSynthesis.cancel();
+                const d = Math.max(0.5, Math.round(distMiles * 10) / 10);
+                const utt = new SpeechSynthesisUtterance('Traffic, traffic! ' + d + ' miles.');
+                utt.rate = 1.15;
+                window.speechSynthesis.speak(utt);
+            } catch(e) {}
+        }
+    }
+
+    function checkProximityAlerts(loc) {
+        const geofsObj = window.geofs || (typeof geofs !== 'undefined' ? geofs : null);
+        const playerAltM = (geofsObj?.aircraft?.instance?.llaLocation?.[2]) || 10000;
+        const playerAltFt = playerAltM * 3.28084;
+        const dangerZone = CONFIG.DANGER_ZONE_MILES || 5.0;
+        const dangerAlt = CONFIG.DANGER_ZONE_ALT_FT || 1000;
+
+        let closestThreat = null;
+        for (let i = 0; i < traffic.length; i++) {
+            const p = traffic[i];
+            if (!p || p.distanceMiles > dangerZone) continue;
+            const pAltFt = (p.alt || 10000) * 3.28084;
+            const altDiff = Math.abs(pAltFt - playerAltFt);
+            if (altDiff <= dangerAlt) {
+                if (!closestThreat || p.distanceMiles < closestThreat.distMi) {
+                    closestThreat = {
+                        plane: p,
+                        distMi: p.distanceMiles,
+                        altDiffFt: Math.round(pAltFt - playerAltFt)
+                    };
+                }
+            }
+        }
+
+        let alertBanner = document.getElementById('geofs-proximity-alert-banner');
+        if (closestThreat) {
+            if (!alertBanner) {
+                alertBanner = document.createElement('div');
+                alertBanner.id = 'geofs-proximity-alert-banner';
+                alertBanner.style.cssText = [
+                    'position:fixed !important',
+                    'top:75px !important',
+                    'left:50% !important',
+                    'transform:translateX(-50%) !important',
+                    'background:rgba(127,29,29,0.95) !important',
+                    'color:#fef2f2 !important',
+                    'border:2px solid #ef4444 !important',
+                    'border-radius:8px !important',
+                    'padding:10px 20px !important',
+                    'font-family:monospace !important',
+                    'font-size:12.5px !important',
+                    'font-weight:bold !important',
+                    'z-index:2147483647 !important',
+                    'box-shadow:0 0 25px rgba(239,68,68,0.85) !important',
+                    'pointer-events:auto !important',
+                    'text-align:center !important'
+                ].join(';');
+                document.body.appendChild(alertBanner);
+            }
+            alertBanner.innerHTML =
+                '<div style="color:#fecaca; font-size:11px; letter-spacing:1px; margin-bottom:2px;">⚠️ TCAS PROXIMITY ALERT — DANGER ZONE BREACH</div>' +
+                '<div style="font-size:13.5px; color:#ffffff;"><b>' + closestThreat.plane.callsign + '</b> (' + (closestThreat.plane.fleet?.airline || 'Commercial') + ') · <b style="color:#fde047;">' + closestThreat.distMi.toFixed(1) + ' MI</b> (' + (closestThreat.altDiffFt >= 0 ? '+' : '') + closestThreat.altDiffFt + ' FT)</div>' +
+                '<div style="margin-top:5px; display:flex; justify-content:center; gap:8px;">' +
+                    '<button id="geofs-teleport-threat-btn" style="background:#dc2626; color:#fff; border:1px solid #f87171; border-radius:4px; padding:2px 8px; font-size:10px; cursor:pointer; font-weight:bold;">🎯 TELEPORT ON TOP</button>' +
+                    '<button id="geofs-mute-threat-btn" style="background:#450a0a; color:#fca5a5; border:1px solid #b91c1c; border-radius:4px; padding:2px 8px; font-size:10px; cursor:pointer;">' + (CONFIG.PROXIMITY_AUDIO_ALERT ? '🔊 MUTE' : '🔇 UNMUTE') + '</button>' +
+                '</div>';
+            alertBanner.style.display = 'block';
+
+            const tpBtn = document.getElementById('geofs-teleport-threat-btn');
+            if (tpBtn) tpBtn.onclick = () => spawnPlayerOnTopOfPlane(closestThreat.plane);
+            const muteBtn = document.getElementById('geofs-mute-threat-btn');
+            if (muteBtn) muteBtn.onclick = () => {
+                CONFIG.PROXIMITY_AUDIO_ALERT = !CONFIG.PROXIMITY_AUDIO_ALERT;
+                if (muteBtn) muteBtn.textContent = CONFIG.PROXIMITY_AUDIO_ALERT ? '🔊 MUTE' : '🔇 UNMUTE';
+            };
+
+            playGeofsTcasSound(closestThreat.distMi);
+        } else {
+            if (alertBanner) {
+                alertBanner.style.display = 'none';
+            }
+        }
+    }
+
     // Top-Notch Route Validator implementation inside Userscript
     function validateFlightRoute(params) {
         params = params || {};
@@ -3113,24 +3470,24 @@ function dismissCrashOverlay() {
         if (Math.abs(lat) < 0.0001 && Math.abs(lon) < 0.0001) return false; // avoid Null Island
 
         const planeAlt = Number.isFinite(plane.alt) ? Math.max(150, Number(plane.alt)) : 3000;
-        // Spawn directly 14 meters (45 ft) directly on top of the aircraft fuselage
-        const spawnAlt = planeAlt + 14;
+        // Spawn 20 meters above and 45 meters in trail for perfect escort formation without freezing or clipping
+        const spawnAlt = planeAlt + 20;
         const heading = Number.isFinite(plane.heading) ? ((Number(plane.heading) % 360 + 360) % 360) : 0;
         const targetSpeedKts = Number.isFinite(plane.speed) ? plane.speed : 440;
 
-        // Micro setback (6 meters) directly above fuselage for perfect overhead cockpit view
-        const setback = movePoint(lat, lon, 6, (heading + 180) % 360);
+        // 45 meters setback directly in trail along heading
+        const setback = movePoint(lat, lon, 45, (heading + 180) % 360);
         teleportPlayerToLocation(setback.lat, setback.lon, spawnAlt, heading, targetSpeedKts, plane.callsign + ' (' + plane.fleet.airline + ' · ' + plane.fleet.type + ')', plane);
 
-        // Lock formation piggyback
+        // Ensure no formation clamp freezes the player in mid-air
         const geofsObj = window.geofs || (typeof geofs !== 'undefined' ? geofs : null);
         if (geofsObj) {
-            geofsObj._formationTargetPlane = plane;
+            geofsObj._formationTargetPlane = null;
         }
 
         showToast(
-            '🎯 <b>SPAWNED DIRECTLY ON TOP:</b> <span style="color:#34d399;">' + plane.callsign + '</span> (' + plane.fleet.airline + ' · ' + plane.fleet.type + ')<br>' +
-            '<span style="font-size:10px; color:#a7f3d0;">' + plane.origin + ' ➔ ' + plane.destination + ' · FL' + Math.round(plane.alt * 3.28084 / 100) + ' (' + Math.round(spawnAlt) + 'm) · ' + Math.round(targetSpeedKts) + ' kts · HDG ' + Math.round(heading) + '°</span>',
+            '🎯 <b>TELEPORTED TO FLIGHT:</b> <span style="color:#34d399;">' + plane.callsign + '</span> (' + plane.fleet.airline + ' · ' + plane.fleet.type + ')<br>' +
+            '<span style="font-size:10px; color:#a7f3d0;">' + plane.origin + ' ➔ ' + plane.destination + ' · FL' + Math.round(plane.alt * 3.28084 / 100) + ' (' + Math.round(spawnAlt) + 'm) · ' + Math.round(targetSpeedKts) + ' kts · HDG ' + Math.round(heading) + '° (FLIGHT CONTROLS ACTIVE)</span>',
             4500
         );
         return true;
@@ -3193,6 +3550,22 @@ function dismissCrashOverlay() {
             '<button id="geofs-spawn-on-top-btn" style="width:100% !important; margin:0 0 6px 0 !important; padding:7px 10px !important; background:linear-gradient(135deg,#059669,#10b981) !important; color:#ffffff !important; border:1px solid #34d399 !important; border-radius:6px !important; font-weight:bold !important; font-size:11.5px !important; cursor:pointer !important; display:flex !important; align-items:center !important; justify-content:center !important; gap:6px !important; box-shadow:0 3px 12px rgba(16,185,129,0.5) !important;">' +
                 '🎯 SPAWN ON TOP OF PLANES (TELEPORT)' +
             '</button>' +
+            '<div style="position:relative !important; margin-bottom:6px !important;">' +
+                '<input id="geofs-callsign-search" type="text" placeholder="🔍 Search plane callsign (e.g. THY1, BAW, DAL)..." style="width:100% !important; box-sizing:border-box !important; background:#0f172a !important; border:1px solid #10b981 !important; color:#ffffff !important; border-radius:6px !important; padding:6px 26px 6px 8px !important; font-size:11px !important; font-family:monospace !important; outline:none !important;" />' +
+                '<button id="geofs-search-clear-btn" style="position:absolute !important; right:6px !important; top:5px !important; background:none !important; border:none !important; color:#94a3b8 !important; font-size:12px !important; cursor:pointer !important; display:none !important;" title="Clear search">✕</button>' +
+            '</div>' +
+            '<div style="display:flex; align-items:center; justify-content:space-between; gap:5px; background:rgba(30,27,75,0.7) !important; border:1px solid #6366f1 !important; border-radius:6px !important; padding:4px 8px !important; margin-bottom:6px !important; font-size:10.5px !important;">' +
+                '<span style="color:#c7d2fe; font-weight:bold;">⚠️ DANGER ZONE:</span>' +
+                '<select id="geofs-danger-zone-select" style="background:#0f172a; color:#a5b4fc; border:1px solid #818cf8; border-radius:4px; padding:2px 4px; font-size:10px; font-family:monospace; outline:none;">' +
+                    '<option value="2">2 mi</option>' +
+                    '<option value="3">3 mi</option>' +
+                    '<option value="5" selected>5 mi</option>' +
+                    '<option value="10">10 mi</option>' +
+                    '<option value="15">15 mi</option>' +
+                '</select>' +
+                '<button id="geofs-tcas-sound-toggle" style="background:#312e81; color:#ffffff; border:1px solid #818cf8; border-radius:4px; padding:2px 6px; font-size:10px; cursor:pointer;" title="Toggle TCAS sound alerts">🔊 AUDIO</button>' +
+                '<button id="geofs-tcas-test-btn" style="background:#4338ca; color:#ffffff; border:1px solid #a5b4fc; border-radius:4px; padding:2px 6px; font-size:10px; cursor:pointer;" title="Test TCAS proximity alarm">⚡ TEST</button>' +
+            '</div>' +
             '<div id="geofs-traffic-status" style="font-size:10px; color:#6ee7b7; margin-bottom:6px;">Loading global flights…</div>' +
             '<div id="geofs-traffic-list" style="max-height:360px; overflow-y:auto;"></div>';
 
@@ -3217,6 +3590,74 @@ function dismissCrashOverlay() {
                 togglePanel(false);
             };
         }
+        const dangerSelect = document.getElementById('geofs-danger-zone-select');
+        if (dangerSelect) {
+            dangerSelect.value = String(CONFIG.DANGER_ZONE_MILES || 5);
+            dangerSelect.onchange = (e) => {
+                CONFIG.DANGER_ZONE_MILES = parseFloat(e.target.value) || 5.0;
+                showToast('⚠️ TCAS Danger Zone set to ' + CONFIG.DANGER_ZONE_MILES + ' miles', 2500);
+            };
+        }
+        const soundToggle = document.getElementById('geofs-tcas-sound-toggle');
+        if (soundToggle) {
+            soundToggle.textContent = CONFIG.PROXIMITY_AUDIO_ALERT ? '🔊 AUDIO: ON' : '🔇 AUDIO: OFF';
+            soundToggle.onclick = () => {
+                CONFIG.PROXIMITY_AUDIO_ALERT = !CONFIG.PROXIMITY_AUDIO_ALERT;
+                soundToggle.textContent = CONFIG.PROXIMITY_AUDIO_ALERT ? '🔊 AUDIO: ON' : '🔇 AUDIO: OFF';
+                showToast('TCAS Audio Alerts: ' + (CONFIG.PROXIMITY_AUDIO_ALERT ? 'ENABLED' : 'MUTED'), 2000);
+            };
+        }
+        const testBtn = document.getElementById('geofs-tcas-test-btn');
+        if (testBtn) {
+            testBtn.onclick = () => {
+                playGeofsTcasSound(CONFIG.DANGER_ZONE_MILES || 5.0);
+                showToast('⚡ TCAS Audio & Visual Test Triggered', 2000);
+            };
+        }
+        const searchInput = document.getElementById('geofs-callsign-search');
+        const clearBtn = document.getElementById('geofs-search-clear-btn');
+        if (searchInput) {
+            if (panelCallsignSearch) {
+                searchInput.value = panelCallsignSearch;
+                if (clearBtn) clearBtn.style.display = 'block';
+            }
+            searchInput.oninput = (e) => {
+                panelCallsignSearch = (e.target.value || '').trim().toUpperCase();
+                if (clearBtn) clearBtn.style.display = panelCallsignSearch ? 'block' : 'none';
+                const currentPlanes = [...traffic]
+                    .filter(p => p.distanceKm <= CONFIG.MAX_RENDER_DIST_KM)
+                    .sort((a, b) => a.distanceKm - b.distanceKm);
+                updatePanel(currentPlanes);
+                const reSearch = document.getElementById('geofs-callsign-search');
+                if (reSearch && document.activeElement !== reSearch) reSearch.focus();
+            };
+            searchInput.onkeydown = (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const filtered = traffic.filter(p => {
+                        if (!panelCallsignSearch) return true;
+                        return (p.callsign && p.callsign.toUpperCase().includes(panelCallsignSearch)) ||
+                               (p.origin && p.origin.toUpperCase().includes(panelCallsignSearch)) ||
+                               (p.destination && p.destination.toUpperCase().includes(panelCallsignSearch)) ||
+                               (p.fleet && p.fleet.airline && p.fleet.airline.toUpperCase().includes(panelCallsignSearch));
+                    });
+                    if (filtered.length > 0) {
+                        spawnPlayerOnTopOfPlane(filtered[0]);
+                    }
+                }
+            };
+        }
+        if (clearBtn) {
+            clearBtn.onclick = () => {
+                panelCallsignSearch = '';
+                if (searchInput) searchInput.value = '';
+                clearBtn.style.display = 'none';
+                const currentPlanes = [...traffic]
+                    .filter(p => p.distanceKm <= CONFIG.MAX_RENDER_DIST_KM)
+                    .sort((a, b) => a.distanceKm - b.distanceKm);
+                updatePanel(currentPlanes);
+            };
+        }
     }
 
     function updatePanel(nearby) {
@@ -3238,6 +3679,18 @@ function dismissCrashOverlay() {
         const isNear = intlTrack.distanceKm <= 80;
 
         const countIn1500 = nearby.filter(p => p.distanceKm <= CONFIG.MAX_RENDER_DIST_KM).length;
+        
+        let displayedFlights = nearby;
+        if (panelCallsignSearch) {
+            displayedFlights = nearby.filter(p =>
+                (p.callsign && p.callsign.toUpperCase().includes(panelCallsignSearch)) ||
+                (p.origin && p.origin.toUpperCase().includes(panelCallsignSearch)) ||
+                (p.destination && p.destination.toUpperCase().includes(panelCallsignSearch)) ||
+                (p.fleet && p.fleet.airline && p.fleet.airline.toUpperCase().includes(panelCallsignSearch)) ||
+                (p.flightNumber && p.flightNumber.toUpperCase().includes(panelCallsignSearch))
+            );
+        }
+
         status.innerHTML =
             '<div style="background:rgba(6,78,59,0.35); border:1px solid #059669; border-radius:5px; padding:4px 6px; margin-bottom:5px;">' +
                 '<div style="color:#34d399; font-weight:bold;">📍 LOCAL AIRPORT: ' + locTrack.airport.code + ' (' + (locTrack.airport.name || locTrack.airport.code) + ') · ' + Math.round(locTrack.distanceKm * 0.621371) + ' mi (' + Math.round(locTrack.distanceKm) + ' km)</div>' +
@@ -3247,45 +3700,58 @@ function dismissCrashOverlay() {
                 '<div style="color:#38bdf8; font-weight:bold;">📡 1,500-MILE ACTIVE RADAR BUBBLE (2,414 KM)</div>' +
                 '<div style="color:#cbd5e1;">Planes in 1,500 mi: <b style="color:#34d399;">' + countIn1500 + '</b> | Movement Spawn: <b style="color:#34d399;">ACTIVE</b></div>' +
             '</div>' +
+            (panelCallsignSearch ? (
+                '<div style="background:rgba(245,158,11,0.18); border:1px solid #f59e0b; border-radius:5px; padding:3px 6px; margin-bottom:5px; font-size:10px; color:#fbbf24; font-weight:bold;">' +
+                    '🔍 Callsign &ldquo;' + panelCallsignSearch + '&rdquo;: ' + displayedFlights.length + ' matching flights (Press Enter to Teleport)' +
+                '</div>'
+            ) : '') +
             '<span style="color:#9ca3af; font-size:9.5px;">Click flight to <b>Spawn On Top of Plane</b> · <b>[X]</b> Toggle Panel · <b>[N]</b> GeoFS Map</span>';
 
-        list.innerHTML = nearby.map(p => {
-            const isCrz = p.isOverflight;
-            const isApp = p.flightPhase === 'APPROACH';
-            const isClb = p.flightPhase === 'CLIMB';
+        if (displayedFlights.length === 0 && panelCallsignSearch) {
+            list.innerHTML =
+                '<div style="padding:20px 10px; text-align:center; color:#94a3b8; font-style:italic;">' +
+                    'No aircraft found matching callsign &ldquo;' + panelCallsignSearch + '&rdquo;.<br>' +
+                    '<span style="font-size:10px; color:#64748b;">Try another callsign query (e.g. THY, BAW, DAL, UAL).</span>' +
+                '</div>';
+        } else {
+            list.innerHTML = displayedFlights.map(p => {
+                const isCrz = p.isOverflight;
+                const isApp = p.flightPhase === 'APPROACH';
+                const isClb = p.flightPhase === 'CLIMB';
 
-            const badgeBg = isCrz ? 'rgba(56,189,248,.18)' : (isApp ? 'rgba(245,158,11,.18)' : (isClb ? 'rgba(16,185,129,.18)' : 'rgba(255,255,255,.08)'));
-            const badgeColor = isCrz ? '#38bdf8' : (isApp ? '#fbbf24' : (isClb ? '#34d399' : '#cbd5e1'));
-            const badgeBorder = isCrz ? 'rgba(56,189,248,.4)' : (isApp ? 'rgba(245,158,11,.4)' : (isClb ? 'rgba(16,185,129,.4)' : 'rgba(255,255,255,.1)'));
-            const badgeText = isCrz ? 'CRUISE (OVERFLIGHT)' : (isApp ? 'APPROACH' : (isClb ? 'CLIMB' : 'EN ROUTE'));
-            const borderLeft = isCrz ? '#38bdf8' : (isApp ? '#f59e0b' : '#10b981');
-            const distMiles = Math.round(p.distanceKm * 0.621371);
+                const badgeBg = isCrz ? 'rgba(56,189,248,.18)' : (isApp ? 'rgba(245,158,11,.18)' : (isClb ? 'rgba(16,185,129,.18)' : 'rgba(255,255,255,.08)'));
+                const badgeColor = isCrz ? '#38bdf8' : (isApp ? '#fbbf24' : (isClb ? '#34d399' : '#cbd5e1'));
+                const badgeBorder = isCrz ? 'rgba(56,189,248,.4)' : (isApp ? 'rgba(245,158,11,.4)' : (isClb ? 'rgba(16,185,129,.4)' : 'rgba(255,255,255,.1)'));
+                const badgeText = isCrz ? 'CRUISE (OVERFLIGHT)' : (isApp ? 'APPROACH' : (isClb ? 'CLIMB' : 'EN ROUTE'));
+                const borderLeft = isCrz ? '#38bdf8' : (isApp ? '#f59e0b' : '#10b981');
+                const distMiles = Math.round(p.distanceKm * 0.621371);
 
-            return (
-                '<div data-plane-id="' + p.id + '" style="padding:7px; margin-bottom:5px; background:rgba(255,255,255,.05); border-left:3px solid ' + borderLeft + '; border-radius:3px; cursor:pointer;" title="Click to teleport and spawn directly on top of this flight">' +
-                    '<div style="display:flex; justify-content:space-between; align-items:center;">' +
-                        '<b style="color:' + badgeColor + '; font-size:12px;">' + p.callsign + '</b>' +
-                        '<span style="background:' + badgeBg + '; color:' + badgeColor + '; border:1px solid ' + badgeBorder + '; padding:1px 5px; border-radius:3px; font-size:9px; font-weight:bold;">' + badgeText + '</span>' +
-                    '</div>' +
-                    '<div style="display:flex; justify-content:space-between; margin-top:2px;">' +
-                        '<span style="color:#93c5fd; font-weight:bold;">' + p.origin + ' ➔ ' + p.destination + '</span>' +
-                        '<span style="color:#cbd5e1; font-size:10px;">' + p.fleet.airline + ' · ' + p.fleet.type + '</span>' +
-                    '</div>' +
-                    (p.estimatedIntlLanding ? (
-                        '<div style="color:#6ee7b7; font-size:9.5px; margin-top:2px;">' +
-                            '🛬 Est. Landing: <b>' + p.estimatedIntlLanding.code + '</b> (' + Math.round(p.estimatedIntlLanding.distanceKm * 0.621371) + ' mi / ' + p.estimatedIntlLanding.distanceKm + 'km · ETE ' + p.estimatedIntlLanding.eteMinutes + 'm · HDG ' + p.estimatedIntlLanding.bearing + '°)' +
-                        '</div>'
-                    ) : '') +
-                    '<div style="color:#94a3b8; font-size:10px; margin-top:2px;">' +
-                        '<b style="color:#38bdf8;">' + distMiles + ' mi</b> (' + p.distanceKm.toFixed(0) + ' km) · FL' + Math.round(p.alt * 3.28084 / 100) + ' · ' + Math.round(p.speed) + 'kts · HDG ' + Math.round(p.heading) + '° · Bank ' + Math.round(p.bankAngle || 0) + '°' +
-                    '</div>' +
-                    '<div style="color:#a5b4fc; font-size:9.5px; margin-top:3px; display:flex; justify-content:space-between; background:rgba(99,102,241,0.12); padding:1px 5px; border-radius:3px; border:1px solid rgba(99,102,241,0.25);">' +
-                        '<span>📡 SQK: <b style="color:#38bdf8;">' + (p.squawk || '4721') + '</b> · HEX: <b style="color:#e2e8f0;">' + (p.hex || 'A10B2C') + '</b></span>' +
-                        '<span style="color:#34d399; font-weight:bold;">FR24 100% ROUTE VERIFIED</span>' +
-                    '</div>' +
-                '</div>'
-            );
-        }).join('');
+                return (
+                    '<div data-plane-id="' + p.id + '" style="padding:7px; margin-bottom:5px; background:rgba(255,255,255,.05); border-left:3px solid ' + borderLeft + '; border-radius:3px; cursor:pointer;" title="Click to teleport and spawn directly on top of this flight">' +
+                        '<div style="display:flex; justify-content:space-between; align-items:center;">' +
+                            '<b style="color:' + badgeColor + '; font-size:12px;">' + p.callsign + '</b>' +
+                            '<span style="background:' + badgeBg + '; color:' + badgeColor + '; border:1px solid ' + badgeBorder + '; padding:1px 5px; border-radius:3px; font-size:9px; font-weight:bold;">' + badgeText + '</span>' +
+                        '</div>' +
+                        '<div style="display:flex; justify-content:space-between; margin-top:2px;">' +
+                            '<span style="color:#93c5fd; font-weight:bold;">' + p.origin + ' ➔ ' + p.destination + '</span>' +
+                            '<span style="color:#cbd5e1; font-size:10px;">' + p.fleet.airline + ' · ' + p.fleet.type + '</span>' +
+                        '</div>' +
+                        (p.estimatedIntlLanding ? (
+                            '<div style="color:#6ee7b7; font-size:9.5px; margin-top:2px;">' +
+                                '🛬 Est. Landing: <b>' + p.estimatedIntlLanding.code + '</b> (' + Math.round(p.estimatedIntlLanding.distanceKm * 0.621371) + ' mi / ' + p.estimatedIntlLanding.distanceKm + 'km · ETE ' + p.estimatedIntlLanding.eteMinutes + 'm · HDG ' + p.estimatedIntlLanding.bearing + '°)' +
+                            '</div>'
+                        ) : '') +
+                        '<div style="color:#94a3b8; font-size:10px; margin-top:2px;">' +
+                            '<b style="color:#38bdf8;">' + distMiles + ' mi</b> (' + p.distanceKm.toFixed(0) + ' km) · FL' + Math.round(p.alt * 3.28084 / 100) + ' · ' + Math.round(p.speed) + 'kts · HDG ' + Math.round(p.heading) + '° · Bank ' + Math.round(p.bankAngle || 0) + '°' +
+                        '</div>' +
+                        '<div style="color:#a5b4fc; font-size:9.5px; margin-top:3px; display:flex; justify-content:space-between; background:rgba(99,102,241,0.12); padding:1px 5px; border-radius:3px; border:1px solid rgba(99,102,241,0.25);">' +
+                            '<span>📡 SQK: <b style="color:#38bdf8;">' + (p.squawk || '4721') + '</b> · HEX: <b style="color:#e2e8f0;">' + (p.hex || 'A10B2C') + '</b></span>' +
+                            '<span style="color:#34d399; font-weight:bold;">FR24 100% ROUTE VERIFIED</span>' +
+                        '</div>' +
+                    '</div>'
+                );
+            }).join('');
+        }
 
         if (list && typeof list.querySelectorAll === 'function') {
             try {
@@ -3494,34 +3960,28 @@ function dismissCrashOverlay() {
             let phase = 'CRUISE';
             let spawnBearing;
 
+            // REALISTIC AIRSPACE SPREAD ACROSS 1,500 MILES:
+            // Prevent planes from packing together or visual crowding.
             if (i === 0) {
-                // Immediate visual approach / contact: 3.5 km (2.2 miles) out, descending toward runway
-                spawnDistMeters = 3500;
+                // Inbound approach traffic: 16 km (~10 miles) out along arrival corridor
+                spawnDistMeters = 16000;
                 spawnBearing = (currentHeading + 180 + (Math.random() * 20 - 10) + 360) % 360;
                 phase = 'APPROACH';
             } else if (i === 1) {
-                // Immediate departure climbing ahead: 4.5 km (2.8 miles) out
-                spawnDistMeters = 4500;
+                // Outbound departure traffic: 28 km (~17 miles) climbing away
+                spawnDistMeters = 28000;
                 spawnBearing = (currentHeading + (Math.random() * 30 - 15) + 360) % 360;
                 phase = 'CLIMB';
-            } else if (i < 4) {
-                // Visual formation / pattern traffic: 6 to 14 km (4 to 8.5 miles)
-                spawnDistMeters = (6 + (i - 1) * 4) * 1000;
-                spawnBearing = (currentHeading + (i * 65 - 40) + 360) % 360;
-            } else if (i < 8) {
-                // Terminal area traffic: 18 to 45 km (11 to 28 miles)
-                spawnDistMeters = (18 + (i - 4) * 7) * 1000;
-                spawnBearing = (i * 137.5077 + 25) % 360;
             } else {
-                // En route traffic dispersed across 1,500 miles
-                const frac = Math.pow((i - 8) / (CONFIG.TRAFFIC_COUNT - 8), 1.25);
-                spawnDistMeters = (50 + frac * (CONFIG.MAX_RENDER_DIST_KM - 80)) * 1000;
-                spawnBearing = (i * 137.5077 + (i * 13) % 47) % 360;
+                // En-route & regional traffic dispersed smoothly across 1,500 miles (50 km to 2,380 km)
+                const frac = (i - 1) / (CONFIG.TRAFFIC_COUNT - 1);
+                spawnDistMeters = (50 + Math.pow(frac, 1.35) * (CONFIG.MAX_RENDER_DIST_KM - 75)) * 1000;
+                spawnBearing = (i * 137.5077 + (i * 17) % 89) % 360;
             }
 
             const spawnPt = movePoint(player[0], player[1], spawnDistMeters, spawnBearing);
 
-            // Select 100% authentic flight from Flightradar24 or certified pair
+            // Select 100% authentic flight from embedded database or certified pair
             let effectiveOrig;
             let effectiveDest;
             let planeFleet;
@@ -3530,74 +3990,141 @@ function dismissCrashOverlay() {
             let effectiveFL = 350;
             let speed = 450;
 
-            if (candidateFlights.length > 0 && i < candidateFlights.length * 2) {
-                frMatch = candidateFlights[i % candidateFlights.length];
-                effectiveOrig = resolveHub(frMatch.originCode);
-                effectiveDest = resolveHub(frMatch.destCode);
-                planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
-                effectiveAirway = frMatch.airwayName || 'J10';
-                effectiveFL = frMatch.cruiseFL || 350;
-                speed = frMatch.speed || 450;
-            } else if (verifiedPairs.length > 0) {
-                const vp = verifiedPairs[i % verifiedPairs.length];
-                effectiveOrig = vp.orig;
-                effectiveDest = vp.dest;
-                planeFleet = vp.fleet;
-                effectiveFL = [310, 330, 350, 370, 390][i % 5];
-                speed = 440 + (i % 5) * 15;
-            } else {
-                frMatch = FR24_FLIGHTS_DATABASE[i % FR24_FLIGHTS_DATABASE.length];
-                effectiveOrig = resolveHub(frMatch.originCode);
-                effectiveDest = resolveHub(frMatch.destCode);
-                planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
-                effectiveFL = frMatch.cruiseFL || 350;
-                speed = frMatch.speed || 450;
+            if (i === 0) {
+                // Inbound arrival sequence MUST have localHub as destination
+                const arrMatch = candidateFlights.find(f => f.destCode === localHub.code) ||
+                                 relevantFr24.find(f => f.destCode === localHub.code) ||
+                                 FR24_FLIGHTS_DATABASE.find(f => f.destCode === localHub.code && isAirportPairRealistic(resolveHub(f.originCode), localHub));
+                if (arrMatch) {
+                    frMatch = arrMatch;
+                    effectiveOrig = resolveHub(frMatch.originCode);
+                    effectiveDest = resolveHub(frMatch.destCode);
+                    planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
+                    effectiveAirway = frMatch.airwayName || 'J10';
+                    effectiveFL = frMatch.cruiseFL || 350;
+                    speed = frMatch.speed || 450;
+                }
+            } else if (i === 1) {
+                // Outbound departure sequence MUST have localHub as origin
+                const depMatch = candidateFlights.find(f => f.originCode === localHub.code) ||
+                                 relevantFr24.find(f => f.originCode === localHub.code) ||
+                                 FR24_FLIGHTS_DATABASE.find(f => f.originCode === localHub.code && isAirportPairRealistic(localHub, resolveHub(f.destCode)));
+                if (depMatch) {
+                    frMatch = depMatch;
+                    effectiveOrig = resolveHub(frMatch.originCode);
+                    effectiveDest = resolveHub(frMatch.destCode);
+                    planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
+                    effectiveAirway = frMatch.airwayName || 'J10';
+                    effectiveFL = frMatch.cruiseFL || 350;
+                    speed = frMatch.speed || 450;
+                }
+            }
+
+            if (!frMatch) {
+                if (candidateFlights.length > 0 && i < candidateFlights.length * 2) {
+                    frMatch = candidateFlights[i % candidateFlights.length];
+                    effectiveOrig = resolveHub(frMatch.originCode);
+                    effectiveDest = resolveHub(frMatch.destCode);
+                    planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
+                    effectiveAirway = frMatch.airwayName || 'J10';
+                    effectiveFL = frMatch.cruiseFL || 350;
+                    speed = frMatch.speed || 450;
+                } else if (verifiedPairs.length > 0) {
+                    const vp = verifiedPairs[i % verifiedPairs.length];
+                    effectiveOrig = vp.orig;
+                    effectiveDest = vp.dest;
+                    planeFleet = vp.fleet;
+                    effectiveFL = [310, 330, 350, 370, 390][i % 5];
+                    speed = 440 + (i % 5) * 15;
+                } else {
+                    frMatch = FR24_FLIGHTS_DATABASE[i % FR24_FLIGHTS_DATABASE.length];
+                    effectiveOrig = resolveHub(frMatch.originCode);
+                    effectiveDest = resolveHub(frMatch.destCode);
+                    planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frMatch.airlineCode);
+                    effectiveFL = frMatch.cruiseFL || 350;
+                    speed = frMatch.speed || 450;
+                }
             }
 
             // CRITICAL SANITY CHECK: Double-check pair is 100% realistic
             if (!isAirportPairRealistic(effectiveOrig, effectiveDest)) {
-                // Fallback to local hub flight
                 const safeBackup = candidateFlights[0] || FR24_FLIGHTS_DATABASE[0];
                 effectiveOrig = resolveHub(safeBackup.originCode);
                 effectiveDest = resolveHub(safeBackup.destCode);
                 planeFleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, safeBackup.airlineCode);
             }
 
-            // Altitude calculation:
-            // Close visual flights (i < 4) have visual altitudes relative to airport elevation
-            let altMeters;
-            if (phase === 'APPROACH' || i === 0) {
-                phase = 'APPROACH';
-                altMeters = Math.max(300, airportAltM + 380 + (i * 120));
-                speed = 220 + (i % 3) * 10;
-            } else if (phase === 'CLIMB' || i === 1) {
-                phase = 'CLIMB';
-                altMeters = Math.max(500, airportAltM + 650 + (i * 200));
-                speed = 260 + (i % 3) * 15;
-            } else if (i < 4) {
-                altMeters = Math.max(800, airportAltM + 1200 + (i * 400));
-                speed = 300 + (i % 4) * 20;
-            } else {
-                altMeters = effectiveFL * 100 * 0.3048;
-            }
-
             const routeWaypoints = (frMatch && frMatch.waypoints && frMatch.waypoints.length > 0)
                 ? frMatch.waypoints.map((w, idx) => ({ lat: w.lat, lon: w.lon, name: w.name || (effectiveAirway + '-' + (idx + 1)) }))
                 : buildAuthenticRouteWaypoints(effectiveOrig, effectiveDest, effectiveAirway);
 
-            // For flights within visual contact (i < 6), KEEP THEM RIGHT AT spawnPt!
-            // Do not snap away to a corridor 250 km away!
             let planeLat = spawnPt.lat;
             let planeLon = spawnPt.lon;
 
-            if (i >= 6) {
-                // Distant cruise flights snap to Great Circle route corridor
-                const snapped = snapPlaneToRouteCorridor(spawnPt.lat, spawnPt.lon, effectiveOrig.lat, effectiveOrig.lon, effectiveDest.lat, effectiveDest.lon);
-                // Only use snapped if it doesn't throw the plane ridiculously far
-                if (distanceKm([spawnPt.lat, spawnPt.lon], [snapped.lat, snapped.lon]) <= 120) {
-                    planeLat = snapped.lat;
-                    planeLon = snapped.lon;
+            if (i === 0) {
+                // Aligned with runway arrival heading
+                planeLat = spawnPt.lat;
+                planeLon = spawnPt.lon;
+            } else if (i === 1) {
+                // Climbing along departure corridor
+                planeLat = spawnPt.lat;
+                planeLon = spawnPt.lon;
+            } else {
+                // Snap plane to the nearest waypoint leg of its assigned route
+                const snapped = snapPlaneToRoutePolyline(spawnPt.lat, spawnPt.lon, routeWaypoints, effectiveOrig, effectiveDest);
+                planeLat = snapped.lat;
+                planeLon = snapped.lon;
+
+                // REALISTIC AIRSPACE SEPARATION:
+                // Verify minimum ATC separation from all previously spawned planes in traffic
+                // Standard separation: at least 38 km (~20.5 nm) or 2,000 ft vertical
+                let conflict = true;
+                let sepAttempts = 0;
+                while (conflict && sepAttempts < 6) {
+                    conflict = false;
+                    for (let tIdx = 0; tIdx < traffic.length; tIdx++) {
+                        const existing = traffic[tIdx];
+                        const dKm = distanceKm([planeLat, planeLon], [existing.lat, existing.lon]);
+                        const altDiffFt = Math.abs((effectiveFL * 100 * 0.3048) - existing.alt) * 3.28084;
+                        if (dKm < 20 || (dKm < 42 && altDiffFt < 2000)) {
+                            conflict = true;
+                            break;
+                        }
+                    }
+                    if (conflict && routeWaypoints.length > 1) {
+                        sepAttempts++;
+                        const legNodes = getPlaneRouteNodes(frMatch, effectiveOrig, effectiveDest);
+                        const altLegIdx = (i + sepAttempts) % Math.max(1, legNodes.length - 1);
+                        const nA = legNodes[altLegIdx] || legNodes[0];
+                        const nB = legNodes[altLegIdx + 1] || legNodes[legNodes.length - 1];
+                        const prog = Math.max(0.08, Math.min(0.92, 0.12 + (((i + sepAttempts * 3) * 0.17) % 0.76)));
+                        const sepPt = intermediateGreatCirclePoint(nA.lat, nA.lon, nB.lat, nB.lon, prog);
+                        planeLat = sepPt.lat;
+                        planeLon = sepPt.lon;
+                        effectiveFL = [310, 330, 350, 370, 390, 410][(i + sepAttempts) % 6];
+                    } else {
+                        break;
+                    }
                 }
+            }
+
+            // Determine flight phase, altitude, and speed consistently from position along route
+            const dToDestMi = distanceKm([planeLat, planeLon], [effectiveDest.lat, effectiveDest.lon]) * 0.621371;
+            const dToOrigMi = distanceKm([planeLat, planeLon], [effectiveOrig.lat, effectiveOrig.lon]) * 0.621371;
+
+            let altMeters;
+            if (dToDestMi <= 25.0 || i === 0) {
+                phase = 'APPROACH';
+                altMeters = Math.max(300, airportAltM + 380 + (i * 120));
+                speed = 220 + (i % 3) * 10;
+            } else if (dToOrigMi <= 50.0 || i === 1) {
+                phase = 'CLIMB';
+                altMeters = Math.max(500, airportAltM + 650 + (i * 200));
+                speed = 260 + (i % 3) * 15;
+            } else {
+                phase = 'CRUISE';
+                altMeters = effectiveFL * 100 * 0.3048;
+                speed = frMatch ? (frMatch.speed || 450) : speed;
             }
 
             const activeWpIdx = findFirstWaypointAhead(planeLat, planeLon, routeWaypoints, effectiveDest);
@@ -3666,50 +4193,103 @@ function dismissCrashOverlay() {
         const numToSpawn = Math.min(count || 3, CONFIG.TRAFFIC_COUNT - traffic.length);
         if (numToSpawn <= 0) return;
 
-        // Relevant authentic Flightradar24 flights
-        const relevantFr24 = FR24_FLIGHTS_DATABASE.filter(f => {
+        // Choose routes that pass near the player
+        const suitable = [];
+        for (let idx = 0; idx < FR24_FLIGHTS_DATABASE.length; idx++) {
+            const f = FR24_FLIGHTS_DATABASE[idx];
             const o = resolveHub(f.originCode);
             const d = resolveHub(f.destCode);
-            if (!o || !d || !isAirportPairRealistic(o, d)) return false;
-            const dO = distanceKm(playerLoc, [o.lat, o.lon]);
-            const dD = distanceKm(playerLoc, [d.lat, d.lon]);
-            return dO <= CONFIG.MAX_RENDER_DIST_KM || dD <= CONFIG.MAX_RENDER_DIST_KM;
-        });
+            if (!o || !d || !isAirportPairRealistic(o, d)) continue;
 
-        const pool = relevantFr24.length > 0 ? relevantFr24 : FR24_FLIGHTS_DATABASE.filter(f => {
-            const o = resolveHub(f.originCode);
-            const d = resolveHub(f.destCode);
-            return isAirportPairRealistic(o, d);
-        });
+            const snapped = snapPlaneToRoutePolyline(playerLoc[0], playerLoc[1], f.waypoints, o, d);
+            if (snapped.distanceKm <= CONFIG.MAX_RENDER_DIST_KM) {
+                suitable.push({
+                    flight: f,
+                    orig: o,
+                    dest: d,
+                    snapped: snapped
+                });
+            }
+        }
+
+        const unusedSuitable = suitable.filter(m => !traffic.some(p => p.callsign === m.flight.callsign));
+        const poolToUse = unusedSuitable.length > 0 ? unusedSuitable : suitable;
+        if (poolToUse.length === 0) return;
 
         for (let k = 0; k < numToSpawn; k++) {
             dynamicFlightCounter++;
-            const frFlight = pool[Math.floor(Math.random() * pool.length)];
-            const effectiveOrig = resolveHub(frFlight.originCode);
-            const effectiveDest = resolveHub(frFlight.destCode);
+            const match = poolToUse[(k + Math.floor(Math.random() * poolToUse.length)) % poolToUse.length];
+            const frFlight = match.flight;
+            const effectiveOrig = match.orig;
+            const effectiveDest = match.dest;
             const fleet = findSuitableFleet(effectiveOrig.code, effectiveDest.code, frFlight.airlineCode);
 
-            // Disperse within 1,500 miles (40 km to 2,000 km)
-            const forwardBearing = (Math.random() * 360);
-            const spawnDistKm = 40 + Math.random() * (CONFIG.MAX_RENDER_DIST_KM - 150);
-            const spawnPt = movePoint(playerLoc[0], playerLoc[1], spawnDistKm * 1000, forwardBearing);
+            // Place plane at a valid point along the route
+            const legNodes = getPlaneRouteNodes(frFlight, effectiveOrig, effectiveDest);
+            const legA = legNodes[match.snapped.legIndex] || legNodes[0];
+            const legB = legNodes[match.snapped.legIndex + 1] || legNodes[legNodes.length - 1];
 
-            let phase = 'CRUISE';
+            const baseProg = match.snapped.progress;
+            const progress = Math.max(0.05, Math.min(0.95, baseProg + (k * 0.12 - 0.06)));
+            const spawnPt = intermediateGreatCirclePoint(legA.lat, legA.lon, legB.lat, legB.lon, progress);
+
+            const distFromPlayerKm = distanceKm(playerLoc, [spawnPt.lat, spawnPt.lon]);
+            if (distFromPlayerKm > CONFIG.MAX_RENDER_DIST_KM) continue;
+
+            // Ensure realistic spatial separation from all existing planes (>= 38 km en-route)
+            const isTooClose = traffic.some(p => distanceKm([spawnPt.lat, spawnPt.lon], [p.lat, p.lon]) < 38);
+            if (isTooClose) {
+                let foundSeparated = false;
+                for (const offset of [0.15, -0.15, 0.28, -0.28]) {
+                    const testProg = Math.max(0.08, Math.min(0.92, baseProg + offset));
+                    const testPt = intermediateGreatCirclePoint(legA.lat, legA.lon, legB.lat, legB.lon, testProg);
+                    const testDist = distanceKm(playerLoc, [testPt.lat, testPt.lon]);
+                    if (testDist <= CONFIG.MAX_RENDER_DIST_KM && !traffic.some(p => distanceKm([testPt.lat, testPt.lon], [p.lat, p.lon]) < 38)) {
+                        spawnPt.lat = testPt.lat;
+                        spawnPt.lon = testPt.lon;
+                        foundSeparated = true;
+                        break;
+                    }
+                }
+                if (!foundSeparated) continue;
+            }
+
             const distToDestMi = distanceKm([spawnPt.lat, spawnPt.lon], [effectiveDest.lat, effectiveDest.lon]) * 0.621371;
             const distToOrigMi = distanceKm([spawnPt.lat, spawnPt.lon], [effectiveOrig.lat, effectiveOrig.lon]) * 0.621371;
 
-            if (distToDestMi <= 25) phase = 'APPROACH';
-            else if (distToOrigMi <= 35) phase = 'CLIMB';
+            let phase = 'CRUISE';
+            if (distToDestMi <= 25.0) {
+                phase = 'APPROACH';
+            } else if (distToOrigMi <= 50.0) {
+                phase = 'CLIMB';
+            } else {
+                phase = 'CRUISE';
+            }
 
             const effectiveFL = frFlight.cruiseFL || 350;
-            const alt = phase === 'APPROACH' ? 800 : (phase === 'CLIMB' ? 2500 : effectiveFL * 100 * 0.3048);
-            const speed = phase === 'APPROACH' ? 230 : (phase === 'CLIMB' ? 280 : (frFlight.speed || 450));
+            const cruiseAltM = effectiveFL * 100 * 0.3048;
+            let altMeters = cruiseAltM;
+            let targetAltMeters = cruiseAltM;
+            let speed = frFlight.speed || 450;
+
+            if (phase === 'APPROACH') {
+                const destElevM = 150 * 0.3048;
+                altMeters = Math.max(destElevM + 120, destElevM + (distToDestMi / 25.0) * 1100);
+                targetAltMeters = destElevM + 10;
+                speed = 210 + (k % 3) * 10;
+            } else if (phase === 'CLIMB') {
+                const origElevM = 150 * 0.3048;
+                altMeters = origElevM + (distToOrigMi / 50.0) * 3800;
+                targetAltMeters = cruiseAltM;
+                speed = 260 + (k % 3) * 15;
+            }
 
             const routeWaypoints = (frFlight.waypoints && frFlight.waypoints.length > 0)
                 ? frFlight.waypoints.map((w, idx) => ({ lat: w.lat, lon: w.lon, name: w.name || (frFlight.airwayName + '-' + (idx + 1)) }))
                 : buildAuthenticRouteWaypoints(effectiveOrig, effectiveDest, frFlight.airwayName || 'J10');
 
-            const activeWp = routeWaypoints[0] || effectiveDest;
+            const activeWpIdx = findFirstWaypointAhead(spawnPt.lat, spawnPt.lon, routeWaypoints, effectiveDest);
+            const activeWp = routeWaypoints[activeWpIdx] || effectiveDest;
             const heading = bearingTo(spawnPt.lat, spawnPt.lon, activeWp.lat, activeWp.lon);
 
             const plane = new TrafficPlane(dynamicFlightCounter, playerLoc, fleet, {
@@ -3725,15 +4305,15 @@ function dismissCrashOverlay() {
 
             plane.lat = spawnPt.lat;
             plane.lon = spawnPt.lon;
-            plane.alt = alt;
-            plane.targetAlt = phase === 'APPROACH' ? 250 : alt;
+            plane.alt = altMeters;
+            plane.targetAlt = targetAltMeters;
             plane.heading = heading;
             plane.speed = speed;
             plane.airwayName = frFlight.airwayName || 'J10';
             plane.flightPhase = phase;
             plane.isOverflight = (phase === 'CRUISE');
             plane.waypoints = routeWaypoints;
-            plane.currentWpIndex = 0;
+            plane.currentWpIndex = activeWpIdx;
 
             plane.callsign = frFlight.callsign;
             plane.flightNumber = frFlight.flightNumber;
@@ -3762,47 +4342,33 @@ function dismissCrashOverlay() {
             // 1. Maintain permanent crash immunity every frame
             applyPermanentCrashImmunity();
 
-            // 2. Smooth formation lock / piggyback if engaged
+            // 2. Active Escort Assist (Velocity & Heading Guidance, NEVER coordinate freeze)
             const target = geofsObj._formationTargetPlane;
             if (target && Number.isFinite(target.lat) && Number.isFinite(target.lon)) {
                 const inst = geofsObj.aircraft.instance;
-                // Rule 3: Read aircraft data via llaLocation and animationValues
-                const lla = inst.llaLocation;
                 const anim = inst.animationValues || inst.animationValue || geofsObj.animation?.values;
 
-                // If user is actively maneuvering, disengage formation lock
-                const hasManualInput = anim && (Math.abs(anim.pitch || 0) > 15 || Math.abs(anim.roll || 0) > 20);
+                // If user touches flight controls, disengage assist immediately
+                const hasManualInput = anim && (Math.abs(anim.pitch || 0) > 4 || Math.abs(anim.roll || 0) > 4);
                 if (hasManualInput) {
                     geofsObj._formationTargetPlane = null;
-                    showToast('🔓 Formation lock disengaged — manual flight controls active', 2000);
+                    showToast('🔓 Flight controls active', 1500);
                 } else {
-                    const targetAlt = Number.isFinite(target.alt) ? target.alt + 14 : 3014;
                     const targetHdg = Number.isFinite(target.heading) ? target.heading : 90;
                     const targetSpd = Number.isFinite(target.speed) ? target.speed : 440;
+                    const speedMs = targetSpd * 0.514444;
+                    const rad = targetHdg * Math.PI / 180;
 
-                    if (Array.isArray(lla)) {
-                        lla[0] = target.lat;
-                        lla[1] = target.lon;
-                        lla[2] = targetAlt;
-                    }
                     if (anim) {
                         anim.heading = targetHdg;
-                        anim.altitude = targetAlt * 3.28084;
                         anim.kias = targetSpd;
                     }
-                    if (inst.rigidBody) {
-                        const speedMs = targetSpd * 0.514444;
-                        const rad = targetHdg * Math.PI / 180;
-                        if (typeof inst.rigidBody.setLinearVelocity === 'function') {
-                            inst.rigidBody.setLinearVelocity([
-                                Math.sin(rad) * speedMs,
-                                Math.cos(rad) * speedMs,
-                                0
-                            ]);
-                        }
-                        if (typeof inst.rigidBody.setAngularVelocity === 'function') {
-                            inst.rigidBody.setAngularVelocity([0, 0, 0]);
-                        }
+                    if (inst.rigidBody && typeof inst.rigidBody.setLinearVelocity === 'function') {
+                        inst.rigidBody.setLinearVelocity([
+                            Math.sin(rad) * speedMs,
+                            Math.cos(rad) * speedMs,
+                            0
+                        ]);
                     }
                 }
             }
@@ -3965,10 +4531,15 @@ function dismissCrashOverlay() {
                     p.distanceMiles = p.distanceKm * 0.621371;
                 });
 
-                // Despawn flights that have drifted beyond the 1,500-mile active bubble or are off-route
+                // Evaluate TCAS proximity alert danger zone
+                checkProximityAlerts(loc);
+
+                // Despawn flights as player naturally moves 1,500 miles away (>= 2,414.02 km)
                 for (let i = traffic.length - 1; i >= 0; i--) {
                     const p = traffic[i];
-                    if (p.distanceKm > CONFIG.DESPAWN_BUFFER_KM) {
+                    if (!p) continue;
+
+                    if (p.distanceKm >= CONFIG.DESPAWN_BUFFER_KM) {
                         hidePlane(p);
                         const marker = mapMarkers.get(p.id);
                         if (marker) {
@@ -3979,8 +4550,7 @@ function dismissCrashOverlay() {
                         continue;
                     }
 
-                    // STRICT ROUTE PLACEMENT ENFORCEMENT:
-                    // "Make it so that if a plane is off route it gets deleted."
+                    // Strict route placement: remove planes that are genuinely off route
                     if (isPlaneOffRoute(p)) {
                         hidePlane(p);
                         const marker = mapMarkers.get(p.id);
@@ -4003,10 +4573,10 @@ function dismissCrashOverlay() {
                     distanceAccumulatedKm = 0;
                 }
 
-                // STRICT REALISM: Only render aircraft in Cesium 3D within visual proximity (<= 250 km / ~155 miles)
-                // Far-away planes (up to 1,500 miles away) stay in the background flight network and NAV map, but are hidden in 3D to avoid unrealistic floating callsigns
+                // Render all active flights in Cesium 3D within the 1,500-mile active bubble (2,414 km)
+                // Cesium DistanceDisplayCondition gracefully manages level-of-detail without abruptly despawning flights
                 traffic.forEach(p => {
-                    if (p.distanceKm <= CONFIG.CLOSE_MESH_DIST_KM) {
+                    if (p.distanceKm <= CONFIG.MAX_RENDER_DIST_KM) {
                         showPlane(p);
                     } else {
                         hidePlane(p);
