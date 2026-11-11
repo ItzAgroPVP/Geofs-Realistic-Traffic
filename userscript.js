@@ -2,7 +2,7 @@
 // @name         GeoFS - Real Airline Traffic & Top-Notch Route Validator
 // @namespace    https://github.com/drew-crypto/GeoFS-Global-Traffic
 // @version      18.3
-// @description  GeoFS synthetic airline traffic with aircraft-matched FlightDeck photos, all-message ACARS replies, and runway-threshold arrivals.
+// @description  GeoFS synthetic airline traffic with identity-locked aircraft photos, open-text ACARS replies, and runway-threshold arrivals.
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://*.geo-fs.com/*
 // @grant        none
@@ -537,7 +537,7 @@
     function getAirportLineLengths(runwayFlow) {
         const runwayFt = Number(runwayFlow?.lengthFt) || (Number(runwayFlow?.lengthM) || 2700) / 0.3048;
         const runwayCount = Math.max(1, Number(runwayFlow?.runwayCount) || 1);
-        // Long runways and multi-runway fields get visibly longer terminal corridors.
+        // Longer runways receive longer runway-aligned arrival and departure corridors.
         const approachNm = Math.max(25, Math.min(58, 20 + Math.max(0, runwayFt - 5000) / 1000 * 2 + Math.min(5, runwayCount - 1) * 1.8));
         const departureNm = Math.max(14, Math.min(38, approachNm * 0.68));
         return { approachNm, departureNm };
@@ -610,60 +610,6 @@
         };
     }
 
-    function getReciprocalAirportRunwayFlow(hub, flow) {
-        if (!hub || !flow || !flow.threshold) return null;
-        const dataProfile = _airportRunwayDatabase.get(hub.code);
-        if (dataProfile && dataProfile.le && dataProfile.he) {
-            const flowIsLe = distanceKm(flow.threshold, dataProfile.le) <= distanceKm(flow.threshold, dataProfile.he);
-            const threshold = flowIsLe ? dataProfile.he : dataProfile.le;
-            const heading = flowIsLe ? dataProfile.heHeading : dataProfile.leHeading;
-            const ids = String(dataProfile.runwayId || 'RWY/RWY').split('/');
-            const runwayId = flowIsLe ? (ids[1] || ids[0]) : (ids[0] || ids[1]);
-            const elevationFt = Number(threshold.elevationFt);
-            return {
-                ...flow,
-                runwayId: runwayId || flow.runwayId,
-                heading: ((Number(heading) || ((flow.heading + 180) % 360)) + 360) % 360,
-                threshold: { lat: Number(threshold.lat), lon: Number(threshold.lon) },
-                elevationM: Number.isFinite(elevationFt) ? Math.max(0, elevationFt * 0.3048) : flow.elevationM
-            };
-        }
-
-        const ids = String(flow.pairId || flow.runwayId || '').split('/');
-        const currentId = String(flow.runwayId || '');
-        let reverseId = ids.find(id => id && id !== currentId) || currentId;
-        if (ids.length === 2 && currentId === ids[1]) reverseId = ids[0];
-        const oppositeThreshold = movePoint(flow.threshold.lat, flow.threshold.lon, Number(flow.lengthM) || 2700, flow.heading);
-        return {
-            ...flow,
-            runwayId: reverseId,
-            heading: (Number(flow.heading) + 180) % 360,
-            threshold: oppositeThreshold
-        };
-    }
-
-    function getAirportArrivalRunwayFlow(hub, aircraftPosition) {
-        const primary = getAirportRunwayFlow(hub);
-        if (!primary || !aircraftPosition || !Number.isFinite(Number(aircraftPosition.lat)) || !Number.isFinite(Number(aircraftPosition.lon))) return primary;
-        const reciprocal = getReciprocalAirportRunwayFlow(hub, primary);
-        const candidates = [primary, reciprocal].filter((flow, index, all) => flow && all.findIndex(other =>
-            other.runwayId === flow.runwayId && Math.abs(signedHeadingDelta(other.heading, flow.heading)) < 1
-        ) === index);
-        if (candidates.length < 2) return primary;
-
-        const score = flow => {
-            const distance = distanceKm(flow.threshold, aircraftPosition);
-            const radial = bearingTo(flow.threshold.lat, flow.threshold.lon, aircraftPosition.lat, aircraftPosition.lon);
-            const inboundCourse = (flow.heading + 180) % 360;
-            const delta = Math.abs(signedHeadingDelta(inboundCourse, radial)) * DEG2RAD;
-            const alongKm = distance * Math.cos(delta);
-            const crossKm = Math.abs(distance * Math.sin(delta));
-            const maxApproachKm = getAirportLineLengths(flow).approachNm * 1.852;
-            return crossKm * 2.2 + (alongKm < 0 ? 500 + Math.abs(alongKm) : 0) + Math.max(0, alongKm - maxApproachKm) * 0.04;
-        };
-        return score(candidates[0]) <= score(candidates[1]) ? candidates[0] : candidates[1];
-    }
-
     function getAirportLineTargets(player) {
         const maxDistKm = CONFIG.MAX_RENDER_DIST_KM + 110;
         const result = [];
@@ -717,46 +663,51 @@
             const materialIn = Cesium.Color.CYAN.withAlpha(0.62);
             const materialOut = Cesium.Color.LIME.withAlpha(0.55);
             try {
-                const arrivalFlows = [target.flow, getReciprocalAirportRunwayFlow(target.hub, target.flow)].filter((flow, index, all) => flow && all.findIndex(other =>
-                    other.runwayId === flow.runwayId && Math.abs(signedHeadingDelta(other.heading, flow.heading)) < 1
-                ) === index);
-                arrivalFlows.forEach((flow, index) => {
-                    const arrivalEntity = viewer.entities.add({
-                        id: 'geofs-baked-traffic-airport-arr-' + target.hub.code + '-' + index,
-                        name: target.hub.code + ' runway ' + flow.runwayId + ' arrival corridor',
-                        polyline: { positions: makeLinePositions(flow, arrivalDistances, true), width, material: materialIn, arcType: Cesium.ArcType.GEODESIC }
-                    });
-                    _airportTrafficLineEntities.push(arrivalEntity);
+                const arrivalEntity = viewer.entities.add({
+                    id: 'geofs-baked-traffic-airport-arr-' + target.hub.code,
+                    name: target.hub.code + ' arrival corridor',
+                    polyline: { positions: makeLinePositions(target.flow, arrivalDistances, true), width, material: materialIn, arcType: Cesium.ArcType.GEODESIC }
                 });
                 const departureEntity = viewer.entities.add({
                     id: 'geofs-baked-traffic-airport-dep-' + target.hub.code,
-                    name: target.hub.code + ' departure corridor',
+                    name: target.hub.code + ' runway departure corridor',
                     polyline: { positions: makeLinePositions(target.flow, departureDistances, false), width, material: materialOut, arcType: Cesium.ArcType.GEODESIC }
                 });
-                _airportTrafficLineEntities.push(departureEntity);
+                // Draw the actual runway centerline between its two thresholds so
+                // the arrival lane visibly terminates on pavement, not the airport
+                // reference point or terminal area.
+                const farThreshold = movePoint(
+                    target.flow.threshold.lat,
+                    target.flow.threshold.lon,
+                    Math.max(500, Number(target.flow.lengthM) || 2500),
+                    target.flow.heading
+                );
+                const runwayAltitude = Math.max(0, Number(target.flow.elevationM) || 0) + 12;
+                const runwayEntity = viewer.entities.add({
+                    id: 'geofs-baked-traffic-airport-rwy-' + target.hub.code,
+                    name: target.hub.code + ' active runway ' + target.flow.runwayId,
+                    polyline: {
+                        positions: Cesium.Cartesian3.fromDegreesArrayHeights([
+                            target.flow.threshold.lon, target.flow.threshold.lat, runwayAltitude,
+                            farThreshold.lon, farThreshold.lat, runwayAltitude
+                        ]),
+                        width: 5,
+                        material: Cesium.Color.YELLOW.withAlpha(0.88),
+                        arcType: Cesium.ArcType.GEODESIC
+                    }
+                });
+                _airportTrafficLineEntities.push(arrivalEntity, departureEntity, runwayEntity);
             } catch (e) {}
         }
     }
 
-    function buildAirportApproachWaypoints(runwayFlow, aircraftPosition) {
+    function buildAirportApproachWaypoints(runwayFlow) {
         const inbound = (runwayFlow.heading + 180) % 360;
         const lengthNm = getAirportLineLengths(runwayFlow).approachNm;
-        const standardDistances = [lengthNm, lengthNm * 0.82, lengthNm * 0.64, lengthNm * 0.46, lengthNm * 0.28, lengthNm * 0.12];
-        let joinNm = lengthNm;
-        if (aircraftPosition && Number.isFinite(Number(aircraftPosition.lat)) && Number.isFinite(Number(aircraftPosition.lon))) {
-            const directKm = distanceKm(runwayFlow.threshold, aircraftPosition);
-            const radial = bearingTo(runwayFlow.threshold.lat, runwayFlow.threshold.lon, aircraftPosition.lat, aircraftPosition.lon);
-            const alignment = Math.abs(signedHeadingDelta(inbound, radial)) * DEG2RAD;
-            const alongNm = Math.max(0, directKm * Math.cos(alignment) * 0.5399568);
-            joinNm = clamp(alongNm * 0.82, 0.45, lengthNm);
-        }
-        const distancesNm = [joinNm]
-            .concat(standardDistances.filter(nm => nm < joinNm - 0.45))
-            .concat([0]);
-        const uniqueDistances = distancesNm.filter((nm, idx, all) => idx === 0 || Math.abs(nm - all[idx - 1]) > 0.2);
-        return uniqueDistances.map((nm, idx) => {
+        const distancesNm = [lengthNm, lengthNm * 0.82, lengthNm * 0.64, lengthNm * 0.46, lengthNm * 0.28, lengthNm * 0.12, 0];
+        return distancesNm.map((nm, idx) => {
             const point = movePoint(runwayFlow.threshold.lat, runwayFlow.threshold.lon, nm * 1852, inbound);
-            return { lat: point.lat, lon: point.lon, name: idx === uniqueDistances.length - 1 ? 'RWY-' + runwayFlow.runwayId + '-THR' : 'IAF-' + runwayFlow.airportCode + '-' + nm.toFixed(1) + 'NM' };
+            return { lat: point.lat, lon: point.lon, name: idx === distancesNm.length - 1 ? 'RWY-' + runwayFlow.runwayId + '-THR' : 'IAF-' + runwayFlow.airportCode + '-' + nm.toFixed(1) + 'NM' };
         });
     }
 
@@ -1549,7 +1500,9 @@
                 }
             }
         }
-        if (destHub) {
+        const lastWaypointName = nodes.length ? String(nodes[nodes.length - 1].name || '') : '';
+        const routeEndsAtRunway = /(?:^|-)RWY-[A-Z0-9]+-THR$/i.test(lastWaypointName) || /^RWY-.*-THR$/i.test(lastWaypointName);
+        if (destHub && !routeEndsAtRunway) {
             const prev = nodes[nodes.length - 1];
             if (!prev || distanceKm(prev, destHub) > 0.5) {
                 nodes.push({ lat: destHub.lat, lon: destHub.lon, name: destHub.code || 'DEST' });
@@ -2975,19 +2928,6 @@
             } else if (origAirportHub && destAirportHub) {
                 const distToDestMi = distanceKm({ lat: this.lat, lon: this.lon }, destAirportHub) * 0.621371;
                 const distToOrigMi = distanceKm({ lat: this.lat, lon: this.lon }, origAirportHub) * 0.621371;
-                if (!this.airportRunway && distToDestMi <= 35.0) {
-                    const arrivalFlow = getAirportArrivalRunwayFlow(destAirportHub, { lat: this.lat, lon: this.lon });
-                    if (arrivalFlow) {
-                        this.airportRunway = arrivalFlow;
-                        this.waypoints = buildAirportApproachWaypoints(arrivalFlow, { lat: this.lat, lon: this.lon });
-                        this.currentWpIndex = 0;
-                        wp = this.waypoints[0] || wp;
-                        this.flightPhase = 'APPROACH';
-                        this.isOverflight = false;
-                        this.speed = Math.min(Number(this.speed) || 230, 230);
-                        this.targetAlt = arrivalFlow.elevationM + Math.max(8, distanceKm({ lat: this.lat, lon: this.lon }, arrivalFlow.threshold) * 52.4);
-                    }
-                }
                 if (this.airportRunway) {
                     const distanceToThresholdKm = distanceKm({ lat: this.lat, lon: this.lon }, this.airportRunway.threshold);
                     if (this.flightPhase === 'APPROACH' && distanceToThresholdKm <= 2.3) {
@@ -3004,26 +2944,42 @@
                     } else if (this.flightPhase === 'APPROACH' || this.flightPhase === 'LANDING' || this.flightPhase === 'TAKEOFF' || this.flightPhase === 'CLIMB') {
                         this.isOverflight = false;
                     }
-                } else if (distToDestMi <= 35.0) {
-                    // If this destination has no runway metadata, keep the arrival in
-                    // descent rather than treating the airport reference point as a runway.
-                    this.flightPhase = 'DESCENT';
-                    this.isOverflight = false;
-                    const destinationElevationM = Math.max(0, Number(destAirportHub.elevationM || destAirportHub.elevM || destAirportHub.altitudeM || 0));
-                    const descentTargetM = destinationElevationM + 3048;
-                    this.targetAlt = Number.isFinite(Number(this.targetAlt)) ? Math.min(Number(this.targetAlt), descentTargetM) : descentTargetM;
-                } else if (distToOrigMi <= 50.0 && this.alt < (this.targetAlt * 0.85)) {
-                    this.flightPhase = 'CLIMB';
-                    this.isOverflight = false;
-                } else if (distToDestMi <= 250.0) {
-                    this.flightPhase = 'DESCENT';
-                    this.isOverflight = false;
-                    const destinationElevationM = Math.max(0, Number(destAirportHub.elevationM || destAirportHub.elevM || destAirportHub.altitudeM || 0));
-                    const descentTargetM = destinationElevationM + 3048;
-                    this.targetAlt = Number.isFinite(Number(this.targetAlt)) ? Math.min(Number(this.targetAlt), descentTargetM) : descentTargetM;
                 } else {
-                    this.flightPhase = 'CRUISE';
-                    this.isOverflight = true;
+                    // Every arrival must acquire a runway-specific route. The old
+                    // fallback switched flights to APPROACH at 25 NM but left their
+                    // waypoints pointed at the airport reference point (terminal).
+                    const resolvedDestinationCode = String(destAirportHub?.code || '').toUpperCase();
+                    const expectedDestinationCode = String(this.destination || '').toUpperCase();
+                    const arrivalRunway = resolvedDestinationCode && resolvedDestinationCode === expectedDestinationCode
+                        ? getAirportRunwayFlow(destAirportHub) : null;
+                    const captureMiles = arrivalRunway
+                        ? Math.max(25, Math.min(80, getAirportLineLengths(arrivalRunway).approachNm * 1.2))
+                        : Infinity;
+                    if (arrivalRunway && distToDestMi <= captureMiles) {
+                        this.airportRunway = arrivalRunway;
+                        this.flightPhase = 'APPROACH';
+                        this.isOverflight = false;
+                        this.waypoints = buildAirportApproachWaypoints(arrivalRunway);
+                        this.currentWpIndex = findFirstWaypointAhead(this.lat, this.lon, this.waypoints, destAirportHub);
+                        const activeArrivalWp = this.waypoints[this.currentWpIndex] || this.waypoints[this.waypoints.length - 1];
+                        if (activeArrivalWp) {
+                            this.targetLat = activeArrivalWp.lat;
+                            this.targetLon = activeArrivalWp.lon;
+                        }
+                        const thresholdDistanceKm = distanceKm({ lat: this.lat, lon: this.lon }, arrivalRunway.threshold);
+                        this.targetAlt = arrivalRunway.elevationM + Math.max(10, thresholdDistanceKm * 52.4);
+                        // Begin a controlled arrival speed, then let existing
+                        // separation logic regulate the final approach.
+                        this.speed = Math.min(Number(this.speed) || 245, 245);
+                    } else if (distToOrigMi <= 50.0 && this.alt < (this.targetAlt * 0.85)) {
+                        this.flightPhase = 'CLIMB';
+                        this.isOverflight = false;
+                    } else {
+                        // If no trustworthy runway threshold exists, do not fake a
+                        // landing at the airport centroid / terminal coordinate.
+                        this.flightPhase = 'CRUISE';
+                        this.isOverflight = true;
+                    }
                 }
             }
 
@@ -3036,10 +2992,9 @@
 
             const isDestinationApproach = (this.currentWpIndex >= this.waypoints.length - 1);
             const runwayFinal = Boolean(this.airportRunway && (this.flightPhase === 'APPROACH' || this.flightPhase === 'LANDING'));
-            const waitingForRunwayData = Boolean(isDestinationApproach && !this.airportRunway && !this.transitOverflight && this.flightPhase === 'DESCENT');
-            const isTurnaroundPoint = waitingForRunwayData ? false : (isDestinationApproach
+            const isTurnaroundPoint = isDestinationApproach
                 ? (runwayFinal ? (distToWpAfter < 0.3 || (distToWpAfter < 0.7 && this.alt <= this.airportRunway.elevationM + 35)) : (distToWpAfter < 3 || (distToWpAfter < 12 && this.alt < 60)))
-                : (runwayFinal ? (distToWpAfter < 1.2 || (distToWpAfter < 3 && relAngle > 85)) : (distToWpAfter < 15 || (distToWpAfter < 45 && relAngle > 85))));
+                : (distToWpAfter < 15 || (distToWpAfter < 45 && relAngle > 85));
 
             if (isTurnaroundPoint) {
                 this.currentWpIndex++;
@@ -3863,6 +3818,17 @@
         return null;
     }
 
+    function getAircraftPhotoIdentityKey(plane) {
+        const modelInfo = getAircraftPhotoModelInfo(plane);
+        const airlineCode = String(plane?.fleet?.code || plane?.airlineCode || plane?.code || 'UNKNOWN').toUpperCase();
+        const registration = String(plane?.registration || plane?.fleet?.registration || plane?.fleet?.tailNumber || '').toUpperCase();
+        const callsign = String(plane?.callsign || plane?.flightNumber || '').toUpperCase();
+        const modelSource = String(plane?.fleet?.modelName || plane?.fleet?.type || plane?.modelName || plane?.type || '').toUpperCase();
+        return [String(plane?.id ?? ''), airlineCode, modelInfo?.code || 'UNKNOWN', registration, callsign, modelSource]
+            .map(part => String(part).replace(/[^A-Z0-9_-]/g, '').slice(0, 48) || '_')
+            .join(':');
+    }
+
     function getAircraftPhotoAirlineTerms(plane) {
         const code = String(plane?.fleet?.code || plane?.airlineCode || plane?.code || '').toUpperCase();
         const aliases = AIRLINE_PHOTO_ALIASES[code] || [];
@@ -4065,9 +4031,10 @@
             const sourceKey = String(item.src || '').split('?')[0].toLowerCase();
             return !AIRCRAFT_PHOTO_USED_FILES.has(item.key) && !AIRCRAFT_PHOTO_USED_FILES.has(sourceKey);
         });
-        // Keep photos varied while possible, but do not leave later flights without
-        // an image just because this airline/model has a small Commons photo pool.
-        const selectionPool = uniqueCandidates.length ? uniqueCandidates : allCandidates;
+        // Never recycle an image that is already assigned to another traffic
+        // aircraft. A missing exact photo is safer than a duplicate or wrong type.
+        const selectionPool = uniqueCandidates;
+        if (!selectionPool.length) return null;
         const score = item => {
             const ratio = item.width / Math.max(1, item.height);
             const airlineText = photoTextMatchesAirline(item.searchableText, airlineTerms) ? 8 : 0;
@@ -4087,52 +4054,51 @@
             pageUrl: chosen.pageUrl,
             title: chosen.title,
             credit: chosen.artist || 'Wikimedia Commons contributor',
-            license: chosen.license || 'See source page'
+            license: chosen.license || 'See source page',
+            modelCode: modelInfo.code,
+            airlineCode
         };
     }
 
-    function getAircraftPhotoAssignmentKey(plane) {
-        if (!plane) return '';
-        const modelInfo = getAircraftPhotoModelInfo(plane);
-        const airlineCode = String(plane?.fleet?.code || plane?.airlineCode || plane?.code || 'UNKNOWN').toUpperCase();
-        return [String(Number(plane.id) || plane.id || ''), airlineCode, modelInfo?.code || 'UNKNOWN'].join(':');
-    }
-
-    function isCurrentPopupPhotoAssignment(planeId, expectedKey) {
-        if (!expectedKey || activeSelectedPlaneId !== Number(planeId)) return false;
+    function setPopupAircraftPhoto(planeId, identityKey, photo) {
         const currentPlane = traffic.find(item => Number(item.id) === Number(planeId));
-        const popup = document.getElementById('geofs-fr24-flight-popup');
-        const region = popup && popup.querySelector('#geofs-fr24-aircraft-photo-region');
-        return !!(currentPlane && popup && region &&
-            getAircraftPhotoAssignmentKey(currentPlane) === expectedKey &&
-            region.getAttribute('data-geofs-photo-key') === expectedKey);
-    }
-
-    function setPopupAircraftPhoto(planeId, photo, expectedKey) {
-        if (!isCurrentPopupPhotoAssignment(planeId, expectedKey)) return;
+        if (activeSelectedPlaneId !== Number(planeId) || !currentPlane) return;
+        if (getAircraftPhotoIdentityKey(currentPlane) !== identityKey) return;
         const popup = document.getElementById('geofs-fr24-flight-popup');
         if (!popup) return;
+        const region = popup.querySelector('#geofs-fr24-aircraft-photo-region');
         const image = popup.querySelector('#geofs-fr24-aircraft-photo');
         const status = popup.querySelector('#geofs-fr24-aircraft-photo-status');
         const credit = popup.querySelector('#geofs-fr24-aircraft-photo-credit');
-        const badge = popup.querySelector('#geofs-fr24-aircraft-photo-badge');
-        if (!image || !status || !credit) return;
+        if (!region || !image || !status || !credit || region.dataset.photoIdentityKey !== identityKey) return;
 
+        const modelInfo = getAircraftPhotoModelInfo(currentPlane);
+        const airlineCode = String(currentPlane?.fleet?.code || currentPlane?.airlineCode || currentPlane?.code || 'UNKNOWN').toUpperCase();
+        const isStillCurrent = () => {
+            const latest = traffic.find(item => Number(item.id) === Number(planeId));
+            return activeSelectedPlaneId === Number(planeId) &&
+                !!latest && getAircraftPhotoIdentityKey(latest) === identityKey &&
+                region.dataset.photoIdentityKey === identityKey;
+        };
+
+        if (photo && (photo.modelCode !== modelInfo?.code || String(photo.airlineCode || '').toUpperCase() !== airlineCode)) {
+            photo = null;
+        }
         if (!photo) {
+            image.onload = null;
+            image.onerror = null;
+            image.removeAttribute('src');
             image.style.display = 'none';
-            status.textContent = 'No verified photo for this aircraft model and airline';
-            status.style.display = 'block';
-            credit.textContent = 'No image verified for this assigned airline and aircraft model';
-            if (badge) badge.textContent = 'NO VERIFIED MATCH';
+            image.style.opacity = '0';
+            status.textContent = 'No exact ' + (modelInfo?.label || 'aircraft') + ' photo verified for ' + airlineCode;
+            status.style.display = 'flex';
+            credit.textContent = 'Photo matching requires both the assigned aircraft family and operator';
+            credit.title = '';
             return;
         }
 
-        image.alt = photo.title || 'Aircraft photograph';
+        image.alt = photo.title || (modelInfo?.label || 'Aircraft') + ' photograph';
         image.title = (photo.credit || 'Wikimedia Commons contributor') + ' · ' + (photo.license || 'See source page');
-
-        // The popup refreshes its flight details periodically. If this aircraft photo
-        // is already loaded, keep the existing bitmap on screen instead of assigning
-        // src again (which can cause a one-frame black flash in Chromium).
         const currentSrc = image.getAttribute('src') || '';
         if (currentSrc === photo.src && image.complete && image.naturalWidth > 0) {
             image.style.display = 'block';
@@ -4140,51 +4106,88 @@
             status.style.display = 'none';
         } else if (currentSrc !== photo.src) {
             image.onload = function() {
-                if (!isCurrentPopupPhotoAssignment(planeId, expectedKey)) return;
+                if (!isStillCurrent()) return;
                 image.style.display = 'block';
                 image.style.opacity = '1';
                 status.style.display = 'none';
             };
             image.onerror = function() {
-                if (!isCurrentPopupPhotoAssignment(planeId, expectedKey)) return;
+                if (!isStillCurrent()) return;
                 image.style.display = 'none';
-                status.textContent = 'Aircraft photo could not be loaded';
-                status.style.display = 'block';
+                status.textContent = 'Exact aircraft photo could not be loaded';
+                status.style.display = 'flex';
             };
             image.src = photo.src;
         }
-
         credit.textContent = 'Photo: ' + (photo.credit || 'Wikimedia Commons contributor') + ' · ' + (photo.license || 'See source page');
         credit.title = photo.pageUrl || '';
-        if (badge) badge.textContent = 'MODEL PHOTO MATCH';
     }
 
     function loadAircraftPhotoForPopup(plane) {
         const planeId = String(plane?.id ?? '');
         if (!planeId) return;
-        // A traffic slot can be reassigned to another carrier or aircraft type.
-        // Include both in the cache key so it never keeps the previous livery photo.
-        const planeKey = getAircraftPhotoAssignmentKey(plane);
+        const modelInfo = getAircraftPhotoModelInfo(plane);
+        const airlineCode = String(plane?.fleet?.code || plane?.airlineCode || plane?.code || 'UNKNOWN').toUpperCase();
+        const planeKey = getAircraftPhotoIdentityKey(plane);
+        const popup = document.getElementById('geofs-fr24-flight-popup');
+        const region = popup && popup.querySelector('#geofs-fr24-aircraft-photo-region');
+        const image = popup && popup.querySelector('#geofs-fr24-aircraft-photo');
+        const status = popup && popup.querySelector('#geofs-fr24-aircraft-photo-status');
+        const credit = popup && popup.querySelector('#geofs-fr24-aircraft-photo-credit');
+
+        // The popup node is deliberately reused during refreshes. Clear it whenever
+        // the selected slot changes registration, callsign, airline, or aircraft
+        // family so an old bitmap can never sit beside new flight details.
+        if (region && region.dataset.photoIdentityKey !== planeKey) {
+            region.dataset.photoIdentityKey = planeKey;
+            if (image) {
+                image.onload = null;
+                image.onerror = null;
+                image.removeAttribute('src');
+                image.style.display = 'none';
+                image.style.opacity = '0';
+                image.alt = 'Aircraft photo loading';
+            }
+            if (status) {
+                status.textContent = modelInfo
+                    ? 'Finding a verified ' + airlineCode + ' ' + modelInfo.label + ' photo…'
+                    : 'Aircraft model is not specific enough for a verified photo';
+                status.style.display = 'flex';
+            }
+            if (credit) {
+                credit.textContent = 'Searching for an exact operator and model match…';
+                credit.title = '';
+            }
+        }
+        if (region && credit) credit.dataset.photoIdentityKey = planeKey;
+        if (region && !region.dataset.photoIdentityKey) region.dataset.photoIdentityKey = planeKey;
+        if (!modelInfo) {
+            setPopupAircraftPhoto(plane.id, planeKey, null);
+            return;
+        }
         if (AIRCRAFT_PHOTO_CACHE.has(planeKey)) {
             const cachedPhoto = AIRCRAFT_PHOTO_CACHE.get(planeKey);
             if (cachedPhoto) {
-                setPopupAircraftPhoto(plane.id, cachedPhoto, planeKey);
+                setPopupAircraftPhoto(plane.id, planeKey, cachedPhoto);
                 return;
             }
-            // A failed/empty lookup is not permanent. Commons may have timed out,
-            // or a later search may return a new airline/model image.
             AIRCRAFT_PHOTO_CACHE.delete(planeKey);
         }
         if (AIRCRAFT_PHOTO_INFLIGHT.has(planeKey)) return;
 
         const request = findUniqueAircraftPhoto(plane).then(photo => {
+            const latestPlane = traffic.find(item => Number(item.id) === Number(planeId));
+            // A response for an old aircraft identity must not be cached/displayed
+            // after GeoFS reuses that traffic slot for a different model/operator.
+            if (!latestPlane || getAircraftPhotoIdentityKey(latestPlane) !== planeKey) return null;
+            if (photo && (photo.modelCode !== modelInfo.code || String(photo.airlineCode || '').toUpperCase() !== airlineCode)) photo = null;
             if (photo) AIRCRAFT_PHOTO_CACHE.set(planeKey, photo);
             else AIRCRAFT_PHOTO_CACHE.delete(planeKey);
-            setPopupAircraftPhoto(plane.id, photo, planeKey);
+            setPopupAircraftPhoto(plane.id, planeKey, photo);
             return photo;
         }).catch(() => {
             AIRCRAFT_PHOTO_CACHE.delete(planeKey);
-            setPopupAircraftPhoto(plane.id, null, planeKey);
+            setPopupAircraftPhoto(plane.id, planeKey, null);
             return null;
         }).finally(() => {
             AIRCRAFT_PHOTO_INFLIGHT.delete(planeKey);
@@ -4789,24 +4792,12 @@
             ];
             return 'CURRENT SYNTHETIC TRAFFIC SNAPSHOT: ' + fields.join(' · ') + '. ONLY FIELDS PRESENT IN THE SIMULATOR OBJECT ARE REPORTED.';
         }
-        if (/\b(hello|hi|hey|good morning|good afternoon|good evening|how are you)\b/.test(q)) {
-            return 'HELLO FROM ' + ctx.callsign + '. FLIGHT-DECK SIMULATION IS ONLINE. WE ARE OPERATING ' + (ctx.route || 'WITHOUT A REPORTED ROUTE') + ' IN THE ' + phaseText + ' PHASE. SEND ANY QUESTION OR MESSAGE AND I WILL RESPOND USING AVAILABLE INFORMATION.';
-        }
-        if (/\b(aircraft|plane|airframe|what are you flying|aircraft type|type of aircraft)\b/.test(q)) {
-            return 'AIRCRAFT IDENTIFICATION: ' + (ctx.aircraft || 'TYPE NOT REPORTED') + ' · OPERATOR: ' + (ctx.airline || 'NOT REPORTED') + ' · CALLSIGN: ' + ctx.callsign + '. THIS IS A SYNTHETIC FLIGHTDECK RECORD.';
-        }
-        if (/\b(airline|operator|company|who are you|callsign|flight number)\b/.test(q)) {
-            return 'FLIGHT IDENTIFICATION: ' + ctx.callsign + ' · ' + (ctx.airline || 'OPERATOR NOT REPORTED') + ' · ' + (ctx.aircraft || 'AIRCRAFT TYPE NOT REPORTED') + ' · ROUTE ' + routeText + '.';
-        }
-        if (/\b(origin|departure|departing|where.*from)\b/.test(q)) {
-            return ctx.origin ? 'DEPARTURE AIRPORT REPORTED BY THE SIMULATOR: ' + ctx.origin + '. ROUTE: ' + routeText + '.' : 'DEPARTURE AIRPORT IS NOT PROVIDED IN THIS TRAFFIC OBJECT.';
-        }
-        if (/\b(destination|arrival airport|where.*going|where.*bound)\b/.test(q)) {
-            return ctx.destination ? 'DESTINATION AIRPORT REPORTED BY THE SIMULATOR: ' + ctx.destination + '. ROUTE: ' + routeText + '. ' + (ctx.eta ? 'SIMULATOR ETA: ' + ctx.eta + 'Z.' : 'ETA IS NOT AVAILABLE.') : 'DESTINATION AIRPORT IS NOT PROVIDED IN THIS TRAFFIC OBJECT.';
-        }
-        const quotedMessage = String(message || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 170);
-        const statusFields = [phaseText, altitudeText, speedText, headingText].join(' · ');
-        return 'ROGER, ' + ctx.callsign + '. YOUR MESSAGE WAS RECEIVED: “' + quotedMessage + '”. THE LOCAL ACARS ENGINE ACKNOWLEDGES EVERY MESSAGE AND REPORTS AVAILABLE SIMULATOR DATA. FOR A FULL OPEN-ENDED ANSWER, CONNECT THE OPTIONAL AI TEXT GENERATOR. I WILL NOT MAKE UP LIVE WEATHER, FUEL, CABIN, MAINTENANCE, ATC, OR OTHER DATA THAT THIS SIMULATOR DOES NOT PROVIDE. CURRENT FLIGHT SNAPSHOT: ' + statusFields + '. NO REAL-WORLD TRANSMISSION OR FLIGHT-CONTROL ACTION HAS OCCURRED.';
+        const originalMessage = String(message || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 240);
+        const dispatchSnapshot = [phaseText, altitudeText, speedText, headingText, positionText].join(' · ');
+        return 'FLIGHT DECK TO DISPATCH — ' + String(ctx.callsign || 'SYNTHETIC FLIGHT') + ': ROGER. YOUR MESSAGE “' + originalMessage + '” HAS BEEN RECEIVED AND LOGGED. ' +
+            'WE CAN CONTINUE THE CONVERSATION, BUT THIS LOCAL MODE CANNOT look up external facts or operate aircraft controls. ' +
+            'CURRENT SIMULATED FLIGHT STATE: ' + dispatchSnapshot + '. ' +
+            'NO FLIGHT-CONTROL ACTION WAS TAKEN. FOR OPEN-ENDED, CONTEXTUAL ANSWERS, CONNECT THE OPTIONAL AI TEXT GENERATOR.';
     }
 
     function extractOpenAiResponseText(data) {
@@ -4836,8 +4827,8 @@
         const ctx = getAcarsFlightContext(plane);
         const instructions = [
             'You are the simulated flight-deck ACARS assistant for a synthetic airline aircraft in a flight simulator.',
-            'Respond helpfully to ANY user message: flight questions, general aviation questions, ordinary conversation, greetings, or unrelated questions. Do not refuse merely because a question is outside the supplied flight telemetry. Use general knowledge for general questions and concise professional aviation phraseology for flight-deck topics, normally 1-3 sentences and under 90 words.',
-            'For facts about THIS synthetic aircraft or flight, use only exact values present in the supplied flight-context JSON. Null means unavailable: say UNABLE / DATA NOT AVAILABLE and do not infer, estimate, or substitute a default. Clearly distinguish general knowledge from facts about this flight.',
+            'Answer as a realistic airline flight crew / aircraft operations system in concise professional aviation phraseology, normally 1-3 sentences and under 75 words.',
+            'Use only the exact values present in the supplied flight-context JSON. Null means unavailable: say UNABLE / DATA NOT AVAILABLE and do not infer, estimate, or substitute a default.',
             'Do not invent or claim CPDLC logon, ADS-C contracts, ATC contact, OOOI events, takeoff or landing confirmation, clearances, runway assignments, weather, winds, fuel, airspeed, or aircraft-system status unless that exact data is supplied.',
             'Ground speed is not airspeed. A route-based ETA may be quoted only when an ETA is explicitly present in the supplied context, and must be called a simulator estimate.',
             'If asked to execute a climb, descent, turn, diversion, landing, or clearance, acknowledge the uplink but clearly state that ACARS does not control this synthetic aircraft and no command or clearance was applied.',
@@ -4857,7 +4848,7 @@
                     '\n\nRECENT ACARS EXCHANGE:\n' + (recentExchange || 'No prior conversation.') +
                     '\n\nNEW ACARS UPLINK: ' + String(userMessage).slice(0, 500)
             }],
-            max_output_tokens: 220
+            max_output_tokens: 160
         };
         const controller = new AbortController();
         let settled = false;
@@ -5385,11 +5376,11 @@
         const hex = plane.icao24Hex || plane.hex || 'Not available';
         const flightNum = plane.flightNumber || plane.callsign;
         const model = plane.fleet?.modelName || plane.fleet?.type || 'Commercial Airliner';
+        const photoIdentityKey = getAircraftPhotoIdentityKey(plane);
         const airline = plane.fleet?.airline || 'Commercial Airline';
         const distMiles = Math.round((plane.distanceKm || 0) * 0.621371);
         const timeStats = getFlightTimeStats(plane);
-        const reg = (plane.fleet?.code || 'N') + (plane.id % 9000 + 1000);
-        const photoAssignmentKey = getAircraftPhotoAssignmentKey(plane);
+        const reg = plane.registration || plane.fleet?.registration || ((plane.fleet?.code || 'N') + (plane.id % 9000 + 1000));
 
         const phaseMeta = getFlightPhaseMeta(plane);
         const phaseBadgeText = phaseMeta.label;
@@ -5417,11 +5408,12 @@
             '</div>'
         ).join('');
 
-        // Preserve the loaded image only when the selected aircraft assignment still
-        // has the same operator and model. A different flight must receive a fresh
-        // image region so an old A350/B737 photo can never leak into the new popup.
+        // Keep the image container and attribution node alive between flight-detail
+        // refreshes. Rebuilding the popup with innerHTML previously destroyed the
+        // image element every second, briefly revealing the dark placeholder.
         const existingPhotoRegion = popup.querySelector('#geofs-fr24-aircraft-photo-region');
         const existingPhotoCredit = popup.querySelector('#geofs-fr24-aircraft-photo-credit');
+        const preservePhotoForIdentity = !!(existingPhotoRegion && existingPhotoRegion.dataset.photoIdentityKey === photoIdentityKey);
         const existingAcarsComposer = popup.querySelector('#geofs-acars-composer');
         const existingAcarsComposerPlaneId = Number(existingAcarsComposer && existingAcarsComposer.getAttribute('data-bound-plane-id'));
         const shouldPreserveComposer = !!(existingAcarsComposer && existingAcarsComposerPlaneId === Number(plane.id));
@@ -5452,7 +5444,7 @@
                     '</button>' +
                 '</div>' +
             '</div>' +
-            '<div id="geofs-fr24-aircraft-photo-region" data-geofs-photo-key="' + photoAssignmentKey + '" style="position: relative; width: 100%; height: 170px; background: #0b1424; overflow: hidden; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">' +
+            '<div id="geofs-fr24-aircraft-photo-region" data-photo-identity-key="' + photoIdentityKey + '" style="position: relative; width: 100%; height: 170px; background: #0b1424; overflow: hidden; flex-shrink: 0; display: flex; align-items: center; justify-content: center;">' +
                 '<img id="geofs-fr24-aircraft-photo" alt="Aircraft photo loading" style="display: none; width: 100%; height: 100%; object-fit: contain; object-position: center center; padding: 5px 8px; box-sizing: border-box; opacity: 0; transition: opacity 0.2s ease;" />' +
                 '<div id="geofs-fr24-aircraft-photo-status" style="position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 12px; color: #9fb4ce; font-size: 11px;">Finding a verified ' + model + ' aircraft photo…</div>' +
                 '<div style="position: absolute; bottom: 7px; left: 12px; right: 12px; display: flex; justify-content: space-between; align-items: flex-end; pointer-events: none;">' +
@@ -5460,8 +5452,8 @@
                         '<div style="font-size: 13px; font-weight: 800; color: #ffffff;">' + model + '</div>' +
                         '<div style="font-size: 10.5px; color: #bfdbfe;">Reg: <span style="font-family: monospace; font-weight: 700;">' + reg + '</span></div>' +
                     '</div>' +
-                    '<div id="geofs-fr24-aircraft-photo-badge" style="background: rgba(15,23,42,0.88); border: 1px solid rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 4px; font-size: 9px; color: #cbd5e1;">' +
-                        'SEARCHING MODEL PHOTO' +
+                    '<div style="background: rgba(15,23,42,0.88); border: 1px solid rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 4px; font-size: 9px; color: #cbd5e1;">' +
+                        'AIRCRAFT PHOTO · EXACT MATCH' +
                     '</div>' +
                 '</div>' +
             '</div>' +
@@ -5543,15 +5535,15 @@
                     '<div id="geofs-acars-message-list" style="max-height:155px;overflow:auto;">' + acarsHtml + '</div>' +
                     '<div id="geofs-acars-composer" data-bound-plane-id="' + plane.id + '" style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(56,189,248,.22);">' +
                         '<div style="font-size:9px;color:#bfdbfe;font-weight:800;letter-spacing:.4px;margin-bottom:5px;">SEND A MESSAGE TO FLIGHT DECK</div>' +
-                        '<textarea id="geofs-acars-input" maxlength="500" rows="2" placeholder="Ask anything or send a dispatch message…" style="width:100%;box-sizing:border-box;resize:vertical;min-height:48px;max-height:100px;padding:8px;background:#07111f;color:#e2e8f0;border:1px solid #334155;border-radius:6px;font:11px/1.4 monospace;outline:none;"></textarea>' +
+                        '<textarea id="geofs-acars-input" maxlength="500" rows="2" placeholder="Type a request, question, or dispatch message…" style="width:100%;box-sizing:border-box;resize:vertical;min-height:48px;max-height:100px;padding:8px;background:#07111f;color:#e2e8f0;border:1px solid #334155;border-radius:6px;font:11px/1.4 monospace;outline:none;"></textarea>' +
                         '<div style="display:flex;gap:7px;align-items:center;margin-top:6px;">' +
                             '<button data-geofs-action="send-acars" data-plane-id="' + plane.id + '" type="button" style="flex:1;padding:8px;background:linear-gradient(135deg,#0369a1,#0e7490);color:#fff;border:1px solid rgba(125,211,252,.35);border-radius:6px;font-size:10px;font-weight:900;cursor:pointer;">↑ SEND UPLINK</button>' +
                             '<span style="font-size:8px;color:#94a3b8;white-space:nowrap;">REPLY ≤ 30 SEC</span>' +
                         '</div>' +
-                        '<div id="geofs-acars-status" aria-live="polite" style="font-size:9px;color:#94a3b8;min-height:13px;margin-top:5px;">Every message gets a reply. Local mode acknowledges all messages; an optional API key enables full natural-language answers.</div>' +
+                        '<div id="geofs-acars-status" aria-live="polite" style="font-size:9px;color:#94a3b8;min-height:13px;margin-top:5px;">Local replies work without setup. Add an API key for natural AI responses.</div>' +
                         '<details style="margin-top:5px;"><summary style="font-size:9px;color:#7dd3fc;cursor:pointer;">Connect AI text generator (optional)</summary>' +
                             '<input id="geofs-acars-api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste OpenAI API key for this tab" style="width:100%;box-sizing:border-box;margin-top:6px;padding:7px;background:#07111f;color:#e2e8f0;border:1px solid #334155;border-radius:5px;font:10px monospace;" />' +
-                            '<div style="font-size:8px;line-height:1.4;color:#94a3b8;margin-top:5px;">Uses OpenAI Responses API with ' + ACARS_AI_MODEL + '. Key stays in memory for this page only and is sent directly to api.openai.com with the message and synthetic flight telemetry. API usage may be billed to your OpenAI account. Without a key, the local reply engine answers known flight questions and acknowledges every other message without inventing unavailable data.</div>' +
+                            '<div style="font-size:8px;line-height:1.4;color:#94a3b8;margin-top:5px;">Uses OpenAI Responses API with ' + ACARS_AI_MODEL + '. Key stays in memory for this page only and is sent directly to api.openai.com with the message and synthetic flight telemetry. API usage may be billed to your OpenAI account. Without a key, the local flight-aware reply engine is used.</div>' +
                         '</details>' +
                     '</div>' +
                 '</div>' +
@@ -5574,10 +5566,9 @@
             '</div>';
 
         const newPhotoRegion = popup.querySelector('#geofs-fr24-aircraft-photo-region');
-        const samePhotoAssignment = !!(existingPhotoRegion && existingPhotoRegion.getAttribute('data-geofs-photo-key') === photoAssignmentKey);
-        if (samePhotoAssignment && newPhotoRegion) newPhotoRegion.replaceWith(existingPhotoRegion);
+        if (preservePhotoForIdentity && existingPhotoRegion && newPhotoRegion) newPhotoRegion.replaceWith(existingPhotoRegion);
         const newPhotoCredit = popup.querySelector('#geofs-fr24-aircraft-photo-credit');
-        if (samePhotoAssignment && existingPhotoCredit && newPhotoCredit) newPhotoCredit.replaceWith(existingPhotoCredit);
+        if (preservePhotoForIdentity && existingPhotoCredit && newPhotoCredit) newPhotoCredit.replaceWith(existingPhotoCredit);
         const newAcarsComposer = popup.querySelector('#geofs-acars-composer');
         if (existingAcarsComposer && newAcarsComposer && shouldPreserveComposer) {
             newAcarsComposer.replaceWith(existingAcarsComposer);
@@ -6790,7 +6781,7 @@
                             '<div style="background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.4); border-radius:4px; padding:3px 2px;">' +
                                 '<div style="font-size:8.5px; color:#fca5a5; font-weight:bold;">0-50 mi</div>' +
                                 '<div style="font-size:13px; font-weight:900; color:#f87171;">' + s.rings.terminal_0_50 + '</div>' +
-                                '<div style="font-size:7.5px; color:#cbd5e1;">Terminal</div>' +
+                                '<div style="font-size:7.5px; color:#cbd5e1;">Near field</div>' +
                             '</div>' +
                             '<div style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.4); border-radius:4px; padding:3px 2px;">' +
                                 '<div style="font-size:8.5px; color:#fde68a; font-weight:bold;">50-250 mi</div>' +
@@ -7177,7 +7168,7 @@
         status.innerHTML =
             '<div style="background:rgba(6,78,59,0.35); border:1px solid #059669; border-radius:5px; padding:4px 6px; margin-bottom:5px;">' +
                 '<div style="color:#34d399; font-weight:bold;">📍 LOCAL AIRPORT: ' + locTrack.airport.code + ' (' + (locTrack.airport.name || locTrack.airport.code) + ') · ' + Math.round(locTrack.distanceKm * 0.621371) + ' mi (' + Math.round(locTrack.distanceKm) + ' km)</div>' +
-                '<div style="color:#a7f3d0; font-size:9.5px;">🛬 ' + (isNear ? 'TERMINAL SECTOR: ' : 'EST. INTL LANDING: ') + '<b>' + intlTrack.hub.code + '</b> (' + (intlTrack.hub.name || intlTrack.hub.code) + ') · ' + Math.round(intlTrack.distanceKm * 0.621371) + ' mi' + (isNear ? ' [APPROACH]' : ' [ENROUTE]') + '</div>' +
+                '<div style="color:#a7f3d0; font-size:9.5px;">🛬 ' + (isNear ? 'RUNWAY APPROACH SECTOR: ' : 'EST. INTL ARRIVAL: ') + '<b>' + intlTrack.hub.code + '</b> (' + (intlTrack.hub.name || intlTrack.hub.code) + ') · ' + Math.round(intlTrack.distanceKm * 0.621371) + ' mi' + (isNear ? ' [APPROACH]' : ' [ENROUTE]') + '</div>' +
             '</div>' +
             '<div style="background:rgba(2,132,199,0.18); border:1px solid rgba(56,189,248,0.4); border-radius:5px; padding:4px 6px; margin-bottom:5px; font-size:10px;">' +
                 '<div style="color:#38bdf8; font-weight:bold; display:flex; justify-content:space-between;">' +
@@ -7654,7 +7645,7 @@
         }
 
         // Reserve a controlled share of the synthetic fleet for airport operations.
-        // Choose the 16 largest nearby runway-equipped route hubs for terminal traffic.
+        // Choose the 16 largest nearby runway-equipped route hubs for runway operations.
         // Visible corridors are drawn separately for every eligible international airport and selected domestic fields.
         const airportCandidates = WORLD_HUBS
             .map(hub => ({ hub, flow: getAirportRunwayFlow(hub), distanceKm: distanceKm(player, [hub.lat, hub.lon]) }))
@@ -7732,7 +7723,7 @@
         }
 
         const nearbyCount = Math.min(10, Math.floor(CONFIG.TRAFFIC_COUNT * 0.02));
-        // Keep terminal traffic a minority. Six positions per airport are enough
+        // Keep local airport traffic a minority. Six positions per airport are enough
         // for a compact mix of arrivals, one runway departure, and one climb-out.
         const airportTrafficCap = Math.floor(CONFIG.TRAFFIC_COUNT * 0.12);
         const totalAirportClumpPlanes = distinctAirports1500.length ? Math.min(
